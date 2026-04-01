@@ -207,16 +207,15 @@ static __device__ void quantize_f32_turbo4_0_block(
     dst->norm = __float2half(norm);
 
     float x[128];
-    float normalized[128];
     for (int j = 0; j < 128; j++) {
         x[j] = src[j] * inv_norm;
-        normalized[j] = x[j];
     }
 
     // Step 2: WHT rotate
     turbo_rotate_forward(x);
 
     // Step 3: 3-bit PolarQuant (bit-packed into qs[48])
+    // x[j] = rotated values, recon[j] = centroid of rotated values
     for (int j = 0; j < QK_TURBO4 * 3 / 8; j++) dst->qs[j] = 0;
     for (int j = 0; j < QK_TURBO4 / 8; j++) dst->signs[j] = 0;
 
@@ -234,10 +233,13 @@ static __device__ void quantize_f32_turbo4_0_block(
         }
     }
 
-    // Step 4: residual (in mixed space, matching Metal)
+    // Step 4: residual in ROTATED space (both x and recon are rotated)
+    // This differs from Metal which uses mixed space (normalized - recon).
+    // Rotated-space residual is compatible with pre-rotate-queries:
+    // dequant can reconstruct entirely in rotated space.
     float rnorm_sq = 0.0f;
     for (int j = 0; j < 128; j++) {
-        x[j] = normalized[j] - recon[j];  // residual
+        x[j] = x[j] - recon[j];  // rotated - rotated = rotated residual
         rnorm_sq += x[j] * x[j];
     }
     dst->rnorm = __float2half(sqrtf(rnorm_sq));

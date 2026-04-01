@@ -136,9 +136,10 @@ static __device__ __forceinline__ void dequantize_turbo4_0(const void * vx, cons
     memcpy(&raw1, &x[ib].qs[bo1 / 8], sizeof(uint16_t));
     const uint8_t idx1 = (raw1 >> (bo1 % 8)) & 0x7;
 
-    // PolarQuant centroid only (QJL reconstruction needs inverse QJL WHT —
-    // too expensive per-element. Pre-rotate-queries handles the MSE rotation,
-    // but QJL residual requires its own inverse projection.)
+    // PolarQuant centroid only for the per-element dequant path.
+    // Full QJL reconstruction (inverse WHT) is done in the FA path
+    // where we can process the full 128-element block at once.
+    // The per-element path (get_rows) doesn't have block context.
     v.x = TURBO_CENTROIDS_3BIT_DEQUANT[idx0] * norm;
     v.y = TURBO_CENTROIDS_3BIT_DEQUANT[idx1] * norm;
 

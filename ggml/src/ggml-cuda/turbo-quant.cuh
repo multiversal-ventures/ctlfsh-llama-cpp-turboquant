@@ -156,7 +156,9 @@ static __device__ void quantize_f32_turbo3_0_group(
     // Step 2: normalize + WHT rotate
     float x[128];
     for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
-    turbo_rotate_forward(x);
+    // DEBUG: skip rotation to test if basic quantize/dequant path works in FA
+    // turbo_rotate_forward(x);
+    // TODO: re-enable after debugging
 
     // Step 3+4: quantize into 4 blocks of 32, accumulate recon norm
     float recon_norm_sq = 0.0f;

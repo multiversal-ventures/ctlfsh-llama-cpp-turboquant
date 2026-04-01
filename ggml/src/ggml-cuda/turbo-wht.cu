@@ -49,6 +49,16 @@ void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(src0->ne[0] % 128 == 0);
 
+    // DEBUG
+    static int wht_call_count = 0;
+    if (wht_call_count < 3) {
+        int dir; memcpy(&dir, dst->op_params, sizeof(int));
+        fprintf(stderr, "TURBO_WHT: dir=%d ne=[%lld,%lld,%lld,%lld] total_groups=%lld\n",
+            dir, (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3],
+            (long long)(ggml_nelements(src0)/128));
+        wht_call_count++;
+    }
+
     const float * src_d = (const float *)src0->data;
     float * dst_d = (float *)dst->data;
 

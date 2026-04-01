@@ -63,6 +63,18 @@ static __global__ void k_set_rows_turbo3(
     block_turbo3_0 * dst_row_ptr = (block_turbo3_0 *)((char *)dst + dst_row*nb1 + i02*nb2 + i03*nb3);
     block_turbo3_0 * dst_grp = dst_row_ptr + i_grp * (QK_TURBO3_GROUP / QK_TURBO3);
 
+    // DEBUG: print first few threads' parameters
+    if (i < 2) {
+        printf("TURBO3_SET_ROWS[%lld]: ne00=%lld ne01=%lld ne02=%lld ne03=%lld "
+               "grp_per_row=%lld i_grp=%lld i01=%lld i02=%lld i03=%lld "
+               "dst_row=%lld s01=%lld s02=%lld nb1=%lld nb2=%lld "
+               "src[0]=%.4f src[1]=%.4f\n",
+               (long long)i, (long long)ne00, (long long)ne01, (long long)ne02, (long long)ne03,
+               (long long)groups_per_row, (long long)i_grp, (long long)i01, (long long)i02, (long long)i03,
+               (long long)dst_row, (long long)s01, (long long)s02, (long long)nb1, (long long)nb2,
+               src_grp[0], src_grp[1]);
+    }
+
     quantize_f32_turbo3_0_group(src_grp, dst_grp);
 
     GGML_UNUSED(ne10);

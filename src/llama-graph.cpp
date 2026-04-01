@@ -2070,6 +2070,14 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens) — ne[0] divisible by 128
     // No reshape/cont/matmul needed — the custom kernel handles groups internally
+    {
+        static int dbg = 0;
+        if (dbg < 3) {
+            LLAMA_LOG_WARN("build_attn: k->type=%d (%s) q->ne[0]=%lld il=%d\n",
+                k->type, ggml_type_name(k->type), (long long)q->ne[0], il);
+            dbg++;
+        }
+    }
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
         if (q->ne[0] % 128 == 0) {
             if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }

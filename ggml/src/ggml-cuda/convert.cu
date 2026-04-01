@@ -758,13 +758,8 @@ static __global__ void dequantize_block_turbo4_0(const void * __restrict__ vx, d
     // PolarQuant reconstruction (centroid lookup, no inverse rotation — handled by graph)
     float val = turbo_centroids_3bit_convert[idx];
 
-    // QJL reconstruction: sign bit contributes rnorm-scaled component
-    // This is approximate for the convert path (full reconstruction needs inverse WHT)
-    const uint8_t sign_bit = (x[ib].signs[j / 8] >> (j % 8)) & 0x1;
-    const float qjl_sign = sign_bit ? 1.0f : -1.0f;
-    const float qjl_scale = 1.2533141373155003f / 128.0f;  // sqrt(pi/2) / d
-    val += qjl_sign * qjl_scale * rnorm;
-
+    // QJL reconstruction skipped — requires inverse QJL WHT per block,
+    // too expensive per-element. PolarQuant centroid only for now.
     y[i] = ggml_cuda_cast<dst_t>(val * norm);
 }
 

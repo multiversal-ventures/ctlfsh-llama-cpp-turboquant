@@ -136,10 +136,11 @@ static __device__ __forceinline__ void dequantize_turbo4_0(const void * vx, cons
     memcpy(&raw1, &x[ib].qs[bo1 / 8], sizeof(uint16_t));
     const uint8_t idx1 = (raw1 >> (bo1 % 8)) & 0x7;
 
-    // PolarQuant centroid + QJL sign contribution
-    const float sign0 = (x[ib].signs[j0 / 8] >> (j0 % 8)) & 0x1 ? 1.0f : -1.0f;
-    const float sign1 = (x[ib].signs[j1 / 8] >> (j1 % 8)) & 0x1 ? 1.0f : -1.0f;
+    // PolarQuant centroid only (QJL reconstruction needs inverse QJL WHT —
+    // too expensive per-element. Pre-rotate-queries handles the MSE rotation,
+    // but QJL residual requires its own inverse projection.)
+    v.x = TURBO_CENTROIDS_3BIT_DEQUANT[idx0] * norm;
+    v.y = TURBO_CENTROIDS_3BIT_DEQUANT[idx1] * norm;
 
-    v.x = (TURBO_CENTROIDS_3BIT_DEQUANT[idx0] + sign0 * qjl_scale * rnorm) * norm;
-    v.y = (TURBO_CENTROIDS_3BIT_DEQUANT[idx1] + sign1 * qjl_scale * rnorm) * norm;
+    GGML_UNUSED(rnorm);
 }

@@ -660,6 +660,11 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
 
 // TurboQuant 4-bit V dequantize for flash attention
 // Block size = 128, 3-bit indices bit-packed in qs[48], QJL signs in signs[16]
+// NOTE: QJL reconstruction requires inverse QJL WHT per block — too expensive
+// for the FA inner loop. We use PolarQuant-only dequant (same centroids, no QJL).
+// This makes turbo4 behave like 3-bit in FA, but with correct norm. The QJL
+// benefit (unbiased inner products) is not realized in this simplified path.
+// Full QJL reconstruction would need a pre-dequant pass or shared-memory WHT.
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
@@ -667,9 +672,7 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     const int64_t ib  = i0 / QK_TURBO4;
     const int     iqs = i0 % QK_TURBO4;
 
-    const float norm  = __half2float(__ldg(&x[ib].norm));
-    const float rnorm = __half2float(__ldg(&x[ib].rnorm));
-    const float qjl_scale = 1.2533141373155003f / 128.0f;  // sqrt(pi/2) / d
+    const float norm = __half2float(__ldg(&x[ib].norm));
 
     static_assert(ne == 2 || ne == 4, "bad ne");
 
@@ -683,9 +686,7 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
         memcpy(&raw, &x[ib].qs[bo / 8], sizeof(uint16_t));
         const uint8_t idx = (raw >> (bo % 8)) & 0x7;
 
-        // QJL sign contribution
-        const float sign = (__ldg(&x[ib].signs[j / 8]) >> (j % 8)) & 0x1 ? 1.0f : -1.0f;
-        const float val = (TURBO_CENTROIDS_3BIT_FA[idx] + sign * qjl_scale * rnorm) * norm;
+        const float val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
 
         if constexpr (std::is_same_v<T, half>) {
             ((half *) dst)[l] = __float2half(val);
@@ -696,7 +697,7 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
 }
 
 // TurboQuant 4-bit K vec_dot for flash attention
-// 3-bit indices bit-packed + QJL sign contribution per element
+// PolarQuant-only path (no QJL — see V dequant comment above)
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -716,9 +717,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
         const int j0   = elem % QK_TURBO4;
         const int j1   = j0 + 1;
 
-        const float norm  = __half2float(__ldg(&K_turbo4[ib].norm));
-        const float rnorm = __half2float(__ldg(&K_turbo4[ib].rnorm));
-        const float qjl_scale = 1.2533141373155003f / 128.0f;
+        const float norm = __half2float(__ldg(&K_turbo4[ib].norm));
 
         // Unpack 3-bit index for j0 from bit-packed qs[48]
         const int bo0 = j0 * 3;
@@ -732,13 +731,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
         memcpy(&raw1, &K_turbo4[ib].qs[bo1 / 8], sizeof(uint16_t));
         const uint8_t idx1 = (raw1 >> (bo1 % 8)) & 0x7;
 
-        // QJL sign contribution
-        const uint8_t sb = __ldg(&K_turbo4[ib].signs[j0 / 8]);
-        const float sign0 = (sb >> (j0 % 8)) & 0x1 ? 1.0f : -1.0f;
-        const float sign1 = (sb >> (j1 % 8)) & 0x1 ? 1.0f : -1.0f;
-
-        const float val0 = (TURBO_CENTROIDS_3BIT_FA[idx0] + sign0 * qjl_scale * rnorm) * norm;
-        const float val1 = (TURBO_CENTROIDS_3BIT_FA[idx1] + sign1 * qjl_scale * rnorm) * norm;
+        const float val0 = TURBO_CENTROIDS_3BIT_FA[idx0] * norm;
+        const float val1 = TURBO_CENTROIDS_3BIT_FA[idx1] * norm;
 
         ggml_cuda_mad(sum, make_float2(val0, val1), ((const float2 *) Q_v)[k_KQ_0/nthreads]);
     }

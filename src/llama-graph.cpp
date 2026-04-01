@@ -2168,8 +2168,24 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
+    // TurboQuant pre-rotate-queries (attn_k path)
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+        if (q->ne[0] % 128 == 0) {
+            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+            q = ggml_turbo_wht(ctx0, q, 0);
+        }
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // TurboQuant V un-rotation (attn_k path)
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+        if (cur->ne[0] % 128 == 0) {
+            if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+            cur = ggml_turbo_wht(ctx0, cur, 1);
+        }
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur);

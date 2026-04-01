@@ -610,6 +610,52 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __rest
     }
 }
 
+// TurboQuant 3-bit K vec_dot for flash attention
+// Uses float Q path (like bf16) — no integer dp4a shortcut available
+// because turbo3 indices are 3-bit split across 2 byte arrays.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_turbo3_0 * K_turbo3 = (const block_turbo3_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    float sum = 0.0f;
+
+    // Iterate over D/2 element pairs, nthreads cooperating
+    // Each thread dequantizes its pair from the turbo3 block on-the-fly
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        // Convert pair index to element index
+        const int elem = k_KQ * 2;
+        const int ib   = elem / QK_TURBO3;   // which 32-element block
+        const int j0   = elem % QK_TURBO3;   // first element in block
+        const int j1   = j0 + 1;
+
+        const float norm = __half2float(K_turbo3[ib].norm);
+
+        // Dequant element j0: unpack 3-bit index, centroid lookup
+        const uint8_t low2_0 = (K_turbo3[ib].qs[j0 / 4] >> ((j0 % 4) * 2)) & 0x3;
+        const uint8_t hi1_0  = (K_turbo3[ib].signs[j0 / 8] >> (j0 % 8)) & 0x1;
+        const float val0 = TURBO_CENTROIDS_3BIT_FA[low2_0 | (hi1_0 << 2)] * norm;
+
+        // Dequant element j1
+        const uint8_t low2_1 = (K_turbo3[ib].qs[j1 / 4] >> ((j1 % 4) * 2)) & 0x3;
+        const uint8_t hi1_1  = (K_turbo3[ib].signs[j1 / 8] >> (j1 % 8)) & 0x1;
+        const float val1 = TURBO_CENTROIDS_3BIT_FA[low2_1 | (hi1_1 << 2)] * norm;
+
+        const float2 K_val = make_float2(val0, val1);
+        const float2 Q_val = ((const float2 *) Q_v)[k_KQ_0/nthreads];
+
+        ggml_cuda_mad(sum, K_val, Q_val);
+    }
+
+    return sum;
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -626,6 +672,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
+        return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;

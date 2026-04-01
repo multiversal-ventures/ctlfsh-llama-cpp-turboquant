@@ -108,3 +108,38 @@ static __device__ __forceinline__ void dequantize_turbo3_0(const void * vx, cons
     v.x = TURBO_CENTROIDS_3BIT_DEQUANT[idx0] * norm;
     v.y = TURBO_CENTROIDS_3BIT_DEQUANT[idx1] * norm;
 }
+
+// turbo4: 3-bit PolarQuant + 1-bit QJL signs, QK=128
+// Simplified dequant for get_rows (no inverse WHT — pre-rotate-queries handles it)
+#define QR_TURBO4 1
+#define QI_TURBO4 (QK_TURBO4 / (2 * QR_TURBO4))
+
+static __device__ __forceinline__ void dequantize_turbo4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+    const float norm  = __half2float(x[ib].norm);
+    const float rnorm = __half2float(x[ib].rnorm);
+    const float qjl_scale = 1.2533141373155003f / 128.0f;  // sqrt(pi/2) / d
+
+    // iqs is the element position (0, 2, 4, ..., 126)
+    const int j0 = iqs;
+    const int j1 = iqs + 1;
+
+    // Unpack 3-bit index from bit-packed qs[48] for j0
+    const int bo0 = j0 * 3;
+    uint16_t raw0;
+    memcpy(&raw0, &x[ib].qs[bo0 / 8], sizeof(uint16_t));
+    const uint8_t idx0 = (raw0 >> (bo0 % 8)) & 0x7;
+
+    // Unpack for j1
+    const int bo1 = j1 * 3;
+    uint16_t raw1;
+    memcpy(&raw1, &x[ib].qs[bo1 / 8], sizeof(uint16_t));
+    const uint8_t idx1 = (raw1 >> (bo1 % 8)) & 0x7;
+
+    // PolarQuant centroid + QJL sign contribution
+    const float sign0 = (x[ib].signs[j0 / 8] >> (j0 % 8)) & 0x1 ? 1.0f : -1.0f;
+    const float sign1 = (x[ib].signs[j1 / 8] >> (j1 % 8)) & 0x1 ? 1.0f : -1.0f;
+
+    v.x = (TURBO_CENTROIDS_3BIT_DEQUANT[idx0] + sign0 * qjl_scale * rnorm) * norm;
+    v.y = (TURBO_CENTROIDS_3BIT_DEQUANT[idx1] + sign1 * qjl_scale * rnorm) * norm;
+}

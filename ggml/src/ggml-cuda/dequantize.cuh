@@ -75,3 +75,36 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 }
+
+// TurboQuant 3-bit dequantize — 2 elements at a time
+// 3-bit index = lower 2 bits from qs + upper 1 bit from signs
+static const __device__ float TURBO_CENTROIDS_3BIT_DEQUANT[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+// QR_TURBO3 = 1: iqs is the element index, dequant returns (iqs, iqs+1)
+#define QR_TURBO3 1
+#define QI_TURBO3 (QK_TURBO3 / (2 * QR_TURBO3))
+
+static __device__ __forceinline__ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    const float norm = __half2float(x[ib].norm);
+
+    // iqs is the element position within the block (0, 2, 4, ..., 30)
+    const int j0 = iqs;
+    const int j1 = iqs + 1;
+
+    // Extract 3-bit index for j0: lower 2 bits from qs, upper 1 bit from signs
+    const uint8_t low2_0 = (x[ib].qs[j0 / 4] >> ((j0 % 4) * 2)) & 0x3;
+    const uint8_t hi1_0  = (x[ib].signs[j0 / 8] >> (j0 % 8)) & 0x1;
+    const uint8_t idx0   = low2_0 | (hi1_0 << 2);
+
+    // Extract 3-bit index for j1
+    const uint8_t low2_1 = (x[ib].qs[j1 / 4] >> ((j1 % 4) * 2)) & 0x3;
+    const uint8_t hi1_1  = (x[ib].signs[j1 / 8] >> (j1 % 8)) & 0x1;
+    const uint8_t idx1   = low2_1 | (hi1_1 << 2);
+
+    v.x = TURBO_CENTROIDS_3BIT_DEQUANT[idx0] * norm;
+    v.y = TURBO_CENTROIDS_3BIT_DEQUANT[idx1] * norm;
+}

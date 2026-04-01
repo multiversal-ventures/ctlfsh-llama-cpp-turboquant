@@ -698,6 +698,83 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+// ============================================================================
+// TurboQuant dequantize kernels for convert path (get_rows, etc.)
+// ============================================================================
+
+static const __device__ float turbo_centroids_3bit_convert[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+template<typename dst_t>
+static __global__ void dequantize_block_turbo3_0(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= k) return;
+
+    const int64_t ib = i / QK_TURBO3;  // block index
+    const int     j  = i % QK_TURBO3;  // element within block
+
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    const float norm = __half2float(x[ib].norm);
+
+    const uint8_t low2 = (x[ib].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+    const uint8_t hi1  = (x[ib].signs[j / 8] >> (j % 8)) & 0x1;
+    const uint8_t idx  = low2 | (hi1 << 2);
+
+    y[i] = ggml_cuda_cast<dst_t>(turbo_centroids_3bit_convert[idx] * norm);
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo3_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = (k + block_size - 1) / block_size;
+    dequantize_block_turbo3_0<<<grid_size, block_size, 0, stream>>>(vx, y, k);
+}
+
+// turbo4 dequant is more complex: 3-bit PolarQuant + QJL reconstruction
+// For the convert path, this is a simplified scalar dequant (no inverse WHT)
+// since pre-rotate-queries handles the rotation at graph level.
+template<typename dst_t>
+static __global__ void dequantize_block_turbo4_0(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= k) return;
+
+    const int64_t ib = i / QK_TURBO4;  // block index
+    const int     j  = i % QK_TURBO4;  // element within block
+
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+    const float norm  = __half2float(x[ib].norm);
+    const float rnorm = __half2float(x[ib].rnorm);
+
+    // Unpack 3-bit index from bit-packed qs[48]
+    const int bit_offset = j * 3;
+    const int byte_idx = bit_offset / 8;
+    const int bit_pos = bit_offset % 8;
+    uint16_t raw;
+    memcpy(&raw, &x[ib].qs[byte_idx], sizeof(uint16_t));
+    const uint8_t idx = (raw >> bit_pos) & 0x7;
+
+    // PolarQuant reconstruction (centroid lookup, no inverse rotation — handled by graph)
+    float val = turbo_centroids_3bit_convert[idx];
+
+    // QJL reconstruction: sign bit contributes rnorm-scaled component
+    // This is approximate for the convert path (full reconstruction needs inverse WHT)
+    const uint8_t sign_bit = (x[ib].signs[j / 8] >> (j % 8)) & 0x1;
+    const float qjl_sign = sign_bit ? 1.0f : -1.0f;
+    const float qjl_scale = 1.2533141373155003f / 128.0f;  // sqrt(pi/2) / d
+    val += qjl_sign * qjl_scale * rnorm;
+
+    y[i] = ggml_cuda_cast<dst_t>(val * norm);
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = (k + block_size - 1) / block_size;
+    dequantize_block_turbo4_0<<<grid_size, block_size, 0, stream>>>(vx, y, k);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -760,6 +837,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_cuda;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_row_turbo4_0_cuda;
         default:
             return nullptr;
     }
@@ -813,6 +894,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_cuda;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_row_turbo4_0_cuda;
         default:
             return nullptr;
     }

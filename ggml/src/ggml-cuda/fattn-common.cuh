@@ -577,6 +577,39 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// TurboQuant 3-bit V dequantize for flash attention
+// Block size = 32, 3-bit index = 2-bit qs + 1-bit signs
+static const __device__ float TURBO_CENTROIDS_3BIT_FA[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+
+    const int64_t ib  = i0 / QK_TURBO3;
+    const int     iqs = i0 % QK_TURBO3;
+
+    const float norm = __half2float(x[ib].norm);
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int j = iqs + l;
+        const uint8_t low2 = (x[ib].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+        const uint8_t hi1  = (x[ib].signs[j / 8] >> (j % 8)) & 0x1;
+        const uint8_t idx  = low2 | (hi1 << 2);
+
+        if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l] = __float2half(TURBO_CENTROIDS_3BIT_FA[idx] * norm);
+        } else if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l] = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
+        }
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -615,6 +648,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
+        return dequantize_V_turbo3_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

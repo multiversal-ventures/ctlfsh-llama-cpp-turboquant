@@ -4850,9 +4850,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_TURBO_WHT:
             {
-                return op->type == GGML_TYPE_F32 &&
+                bool ok = op->type == GGML_TYPE_F32 &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        op->src[0]->ne[0] % 128 == 0;
+                static int wht_check = 0;
+                if (wht_check < 3) {
+                    fprintf(stderr, "CUDA_SUPPORTS_OP(TURBO_WHT): ne0=%lld type=%d src_type=%d -> %s\n",
+                        (long long)op->src[0]->ne[0], op->type, op->src[0]->type, ok ? "YES" : "NO");
+                    wht_check++;
+                }
+                return ok;
             } break;
         case GGML_OP_SET:
             {

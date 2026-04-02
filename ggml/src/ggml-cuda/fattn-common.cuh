@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "turbo-qjl.cuh"
 
 #include <cstdint>
 
@@ -658,16 +659,10 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
     return sum;
 }
 
-// TurboQuant 4-bit: turbo4 uses the SAME centroid dequant as turbo3
-// in the FA path. The QJL residual reconstruction (inverse QJL WHT)
-// is too expensive to inline in FA templates — it triples nvcc compile
-// time. Instead, turbo4 FA uses PolarQuant-only (centroid × norm).
-//
-// This means turbo4 FA quality = turbo3 FA quality (3-bit centroids).
-// The extra storage (rnorm + QJL signs) is unused during FA attention.
-// Full QJL benefit requires a pre-dequant pass or future shared-memory
-// cooperative WHT implementation.
-
+// TurboQuant 4-bit V dequantize for flash attention
+// Full QJL reconstruction: inverse QJL WHT per block via __noinline__ device
+// function in turbo-qjl.cuh. Previous attempt with __forceinline__ tripled
+// nvcc compile time — __noinline__ compiles the WHT once per TU.
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
@@ -675,26 +670,23 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     const int64_t ib  = i0 / QK_TURBO4;
     const int     iqs = i0 % QK_TURBO4;
 
-    const float norm = __half2float(__ldg(&x[ib].norm));
+    // Reconstruct full block with QJL (noinline — no template bloat)
+    float block_vals[128];
+    turbo4_dequant_block_qjl(&x[ib], block_vals);
 
     static_assert(ne == 2 || ne == 4, "bad ne");
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
-        const int j = iqs + l;
-        const int bo = j * 3;
-        uint16_t raw;
-        memcpy(&raw, &x[ib].qs[bo / 8], sizeof(uint16_t));
-        const uint8_t idx = (raw >> (bo % 8)) & 0x7;
-        const float val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
-
         if constexpr (std::is_same_v<T, half>) {
-            ((half *) dst)[l] = __float2half(val);
+            ((half *) dst)[l] = __float2half(block_vals[iqs + l]);
         } else if constexpr (std::is_same_v<T, float>) {
-            ((float *) dst)[l] = val;
+            ((float *) dst)[l] = block_vals[iqs + l];
         }
     }
 }
 
+// TurboQuant 4-bit K vec_dot with full QJL reconstruction.
+// Iterates per-block: reconstruct QJL once (noinline), then dot-product with Q.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -705,30 +697,26 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
 
     float sum = 0.0f;
 
+    // Iterate per-block: reconstruct QJL once, then process all elements
+    constexpr int n_blocks = D / QK_TURBO4;
+
+    for (int ib = 0; ib < n_blocks; ib++) {
+        float block_vals[128];
+        turbo4_dequant_block_qjl(&K_turbo4[ib], block_vals);
+
+        // Process pairs within this block, matching the standard FA indexing
 #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int elem = k_KQ * 2;
-        const int ib   = elem / QK_TURBO4;
-        const int j0   = elem % QK_TURBO4;
-        const int j1   = j0 + 1;
+        for (int j_base = 0; j_base < QK_TURBO4/2; j_base += nthreads) {
+            const int j_pair = j_base + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+            if (j_pair >= QK_TURBO4/2) break;
 
-        const float norm = __half2float(__ldg(&K_turbo4[ib].norm));
+            const int j0 = j_pair * 2;
+            const float2 K_val = make_float2(block_vals[j0], block_vals[j0 + 1]);
 
-        const int bo0 = j0 * 3;
-        uint16_t raw0;
-        memcpy(&raw0, &K_turbo4[ib].qs[bo0 / 8], sizeof(uint16_t));
-        const uint8_t idx0 = (raw0 >> (bo0 % 8)) & 0x7;
-
-        const int bo1 = j1 * 3;
-        uint16_t raw1;
-        memcpy(&raw1, &K_turbo4[ib].qs[bo1 / 8], sizeof(uint16_t));
-        const uint8_t idx1 = (raw1 >> (bo1 % 8)) & 0x7;
-
-        const float val0 = TURBO_CENTROIDS_3BIT_FA[idx0] * norm;
-        const float val1 = TURBO_CENTROIDS_3BIT_FA[idx1] * norm;
-
-        ggml_cuda_mad(sum, make_float2(val0, val1), ((const float2 *) Q_v)[k_KQ_0/nthreads]);
+            // Q_v index: global pair position, same stride pattern as other types
+            const int global_k_KQ_0 = ib * (QK_TURBO4/2) + j_base;
+            ggml_cuda_mad(sum, K_val, ((const float2 *) Q_v)[global_k_KQ_0/nthreads]);
+        }
     }
 
     return sum;

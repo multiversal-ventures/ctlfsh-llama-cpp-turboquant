@@ -3159,6 +3159,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cuda-freeze"},
+        "use cuda-checkpoint to freeze/thaw CUDA context on idle instead of destroying and reloading model "
+        "(requires cuda-checkpoint binary in PATH, must be run as root or with CAP_SYS_PTRACE)",
+        [](common_params & params) {
+            params.cuda_freeze = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
         [](common_params & params) {

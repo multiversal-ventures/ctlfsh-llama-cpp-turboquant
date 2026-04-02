@@ -595,6 +595,7 @@ struct common_params {
     std::string reasoning_budget_message; // message injected before end tag when budget exhausted
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
+    bool cuda_freeze = false;      // if true, use cuda-checkpoint to freeze/thaw CUDA context on idle
 
     std::vector<std::string> api_keys;
 

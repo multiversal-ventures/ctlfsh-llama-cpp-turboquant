@@ -1,29 +1,28 @@
 #pragma once
 
 #include "common.cuh"
-#include "turbo-quant.cuh"
 
 // ============================================================================
-// QJL reconstruction for turbo4 flash attention
+// QJL reconstruction for turbo4 flash attention — warp shuffle FWHT
 //
-// These functions are __noinline__ to prevent nvcc from inlining the
-// 128-element FWHT butterfly into every FA template instantiation.
-// The reverted commit 8c031cfac had these as __forceinline__ which
-// tripled compile time and made 4-vCPU machines unresponsive.
+// Previous approach used __noinline__ device functions with float[128] local
+// arrays. This caused massive register spilling (1KB per thread) and dropped
+// generation from 47 t/s to 2 t/s at 8K context.
 //
-// __noinline__ means nvcc compiles the function once per translation unit
-// and generates a device function call — negligible overhead vs the
-// 896 FLOPs of the FWHT itself.
+// This version uses warp shuffle FWHT: each thread holds 4 elements in
+// registers, butterfly stages use __shfl_xor_sync. Zero local memory,
+// zero shared memory, ~28 shuffles per FWHT.
+//
+// Layout: thread t holds elements [4t, 4t+1, 4t+2, 4t+3].
 // ============================================================================
 
-// Centroids array accessible from FA templates
+// Centroids for FA dequant
 static __device__ const float TURBO_CENTROIDS_3BIT_QJL[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
      0.021460f,  0.065717f,  0.117832f,  0.190685f
 };
 
-// QJL sign arrays for inverse reconstruction (seed=1042)
-// Duplicated from turbo-quant.cuh for FA compilation units.
+// QJL sign arrays (seed=1042)
 static __device__ const float TURBO_QJL_S1_FA[128] = {
     1,-1,-1,-1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,1,1,-1,1,1,-1,1,-1,-1,1,
     1,1,1,1,-1,-1,1,1,-1,1,-1,-1,1,-1,1,1,1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,1,
@@ -37,63 +36,103 @@ static __device__ const float TURBO_QJL_S2_FA[128] = {
     1,-1,-1,1,1,-1,1,1,-1,1,1,1,-1,1,1,1,-1,-1,1,-1,1,-1,-1,1,-1,1,-1,1,1,1,1,-1
 };
 
-// Inverse QJL WHT: unpack signs → signs2 → FWHT → signs1
-// __noinline__ is critical — prevents nvcc template bloat
-static __device__ __noinline__ void turbo4_qjl_inverse_128(float * __restrict__ x) {
-    // Apply signs2
-    for (int i = 0; i < 128; i++) x[i] *= TURBO_QJL_S2_FA[i];
-
-    // FWHT (self-inverse up to normalization)
-    for (int h = 1; h < 128; h *= 2) {
-        for (int i = 0; i < 128; i += h * 2) {
-            for (int j = i; j < i + h; j++) {
-                float a = x[j], b = x[j + h];
-                x[j] = a + b;
-                x[j + h] = a - b;
-            }
+// ============================================================================
+// Warp shuffle FWHT: 128-element transform using 4 registers per thread.
+// Modifies r0..r3 in place. All 32 lanes must participate.
+// ============================================================================
+static __device__ __forceinline__ void turbo4_warp_fwht(
+        float & r0, float & r1, float & r2, float & r3, const int lane) {
+    // h=1: local butterfly (r0,r1) and (r2,r3)
+    {
+        float a = r0, b = r1;
+        r0 = a + b; r1 = a - b;
+        a = r2; b = r3;
+        r2 = a + b; r3 = a - b;
+    }
+    // h=2: local butterfly (r0,r2) and (r1,r3)
+    {
+        float a = r0, b = r2;
+        r0 = a + b; r2 = a - b;
+        a = r1; b = r3;
+        r1 = a + b; r3 = a - b;
+    }
+    // h=4,8,16,32,64: warp shuffle butterflies
+    #pragma unroll
+    for (int h = 4; h < 128; h *= 2) {
+        const int mask = h / 4;
+        const float p0 = __shfl_xor_sync(0xFFFFFFFF, r0, mask);
+        const float p1 = __shfl_xor_sync(0xFFFFFFFF, r1, mask);
+        const float p2 = __shfl_xor_sync(0xFFFFFFFF, r2, mask);
+        const float p3 = __shfl_xor_sync(0xFFFFFFFF, r3, mask);
+        if ((lane & mask) == 0) {
+            r0 += p0; r1 += p1; r2 += p2; r3 += p3;
+        } else {
+            r0 = p0 - r0; r1 = p1 - r1; r2 = p2 - r2; r3 = p3 - r3;
         }
     }
-
-    // Normalize: 1/sqrt(128)
-    const float inv = 0.08838834764831845f;
-    for (int i = 0; i < 128; i++) x[i] *= inv;
-
-    // Apply signs1
-    for (int i = 0; i < 128; i++) x[i] *= TURBO_QJL_S1_FA[i];
 }
 
-// Reconstruct full turbo4 block (128 elements) with QJL.
-// Returns centroid[j] + qjl_recon[j], all in rotated space, scaled by norm.
-// __noinline__ — this calls turbo4_qjl_inverse_128 which is also noinline.
-static __device__ __noinline__ void turbo4_dequant_block_qjl(
-        const block_turbo4_0 * __restrict__ blk, float * __restrict__ out) {
+// ============================================================================
+// Warp-cooperative turbo4 QJL reconstruction.
+// Each thread unpacks 4 QJL signs, does inverse QJL WHT via warp shuffles,
+// adds centroid, scales by norm. Result in r0..r3 (4 elements per thread).
+//
+// Layout: thread t's r0..r3 = reconstructed K[4t], K[4t+1], K[4t+2], K[4t+3]
+// ============================================================================
+static __device__ __forceinline__ void turbo4_warp_dequant_block(
+        const block_turbo4_0 * __restrict__ blk,
+        float & r0, float & r1, float & r2, float & r3,
+        const int lane) {
 
-    const float norm  = __half2float(blk->norm);
-    const float rnorm = __half2float(blk->rnorm);
-    const float qjl_scale = 1.2533141373155003f / 128.0f; // sqrt(pi/2) / d
+    const int base = lane * 4;
 
-    // Step 1: unpack QJL signs → ±1.0
-    float qjl[128];
-    for (int j = 0; j < 128; j++) {
-        uint8_t bit = (blk->signs[j / 8] >> (j % 8)) & 0x1;
-        qjl[j] = bit ? 1.0f : -1.0f;
+    // Step 1: Unpack 4 QJL signs → ±1.0
+    {
+        const uint8_t sbyte = __ldg(&blk->signs[base / 8]);
+        const int off = base % 8;
+        r0 = ((sbyte >> (off + 0)) & 1) ? 1.0f : -1.0f;
+        r1 = ((sbyte >> (off + 1)) & 1) ? 1.0f : -1.0f;
+        r2 = ((sbyte >> (off + 2)) & 1) ? 1.0f : -1.0f;
+        r3 = ((sbyte >> (off + 3)) & 1) ? 1.0f : -1.0f;
     }
 
-    // Step 2: inverse QJL WHT → residual estimate in rotated space
-    turbo4_qjl_inverse_128(qjl);
+    // Step 2: Apply QJL signs2
+    r0 *= TURBO_QJL_S2_FA[base + 0];
+    r1 *= TURBO_QJL_S2_FA[base + 1];
+    r2 *= TURBO_QJL_S2_FA[base + 2];
+    r3 *= TURBO_QJL_S2_FA[base + 3];
 
-    // Step 3: scale residual by sqrt(pi/2)/128 * rnorm
-    for (int j = 0; j < 128; j++) {
-        qjl[j] *= qjl_scale * rnorm;
-    }
+    // Step 3: Warp shuffle FWHT
+    turbo4_warp_fwht(r0, r1, r2, r3, lane);
 
-    // Step 4: centroid + QJL residual, all in rotated space, scaled by norm
-    for (int j = 0; j < 128; j++) {
-        const int bo = j * 3;
+    // Step 4: Normalize (1/sqrt(128)) and apply signs1
+    const float inv = 0.08838834764831845f;
+    r0 *= inv * TURBO_QJL_S1_FA[base + 0];
+    r1 *= inv * TURBO_QJL_S1_FA[base + 1];
+    r2 *= inv * TURBO_QJL_S1_FA[base + 2];
+    r3 *= inv * TURBO_QJL_S1_FA[base + 3];
+
+    // Step 5: Scale QJL residual by sqrt(pi/2)/128 * rnorm
+    const float rnorm = __half2float(__ldg(&blk->rnorm));
+    const float qjl_scale = 1.2533141373155003f / 128.0f * rnorm;
+    r0 *= qjl_scale;
+    r1 *= qjl_scale;
+    r2 *= qjl_scale;
+    r3 *= qjl_scale;
+
+    // Step 6: Add centroid and scale by norm
+    const float norm = __half2float(__ldg(&blk->norm));
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int pos = base + j;
+        const int bo = pos * 3;
         uint16_t raw;
         memcpy(&raw, &blk->qs[bo / 8], sizeof(uint16_t));
         const uint8_t idx = (raw >> (bo % 8)) & 0x7;
+        const float centroid = TURBO_CENTROIDS_3BIT_QJL[idx];
 
-        out[j] = (TURBO_CENTROIDS_3BIT_QJL[idx] + qjl[j]) * norm;
+        float * r = (j == 0) ? &r0 : (j == 1) ? &r1 : (j == 2) ? &r2 : &r3;
+        *r = (centroid + *r) * norm;
     }
 }

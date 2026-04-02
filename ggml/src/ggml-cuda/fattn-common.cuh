@@ -653,40 +653,53 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
         const float val0 = TURBO_CENTROIDS_3BIT_FA[low2_0 | (hi1_0 << 2)] * norm;
         const float val1 = TURBO_CENTROIDS_3BIT_FA[low2_1 | (hi1_1 << 2)] * norm;
 
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const half2 q_h2 = ((const half2 *) Q_v)[k_KQ_0/nthreads];
+        sum += val0 * __half2float(q_h2.x) + val1 * __half2float(q_h2.y);
+#else
         ggml_cuda_mad(sum, make_float2(val0, val1), ((const float2 *) Q_v)[k_KQ_0/nthreads]);
+#endif
     }
 
     return sum;
 }
 
-// TurboQuant 4-bit V dequantize for flash attention
-// Full QJL reconstruction: inverse QJL WHT per block via __noinline__ device
-// function in turbo-qjl.cuh. Previous attempt with __forceinline__ tripled
-// nvcc compile time — __noinline__ compiles the WHT once per TU.
+// TurboQuant 4-bit V dequantize — warp-cooperative QJL via warp shuffles.
+// V_rows_per_thread=4 for turbo4, so 32 threads × 4 = 128 = one block.
+// The FWHT layout (thread t → elements [4t..4t+3]) matches the V dequant
+// element assignment exactly, so no redistribution is needed.
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
 
     const int64_t ib  = i0 / QK_TURBO4;
-    const int     iqs = i0 % QK_TURBO4;
+    const int     lane = (i0 % QK_TURBO4) / 4;
 
-    // Reconstruct full block with QJL (noinline — no template bloat)
-    float block_vals[128];
-    turbo4_dequant_block_qjl(&x[ib], block_vals);
+    // Warp-cooperative QJL reconstruction — 4 registers, no local memory
+    float r0, r1, r2, r3;
+    turbo4_warp_dequant_block(&x[ib], r0, r1, r2, r3, lane);
 
     static_assert(ne == 2 || ne == 4, "bad ne");
-#pragma unroll
-    for (int l = 0; l < ne; ++l) {
-        if constexpr (std::is_same_v<T, half>) {
-            ((half *) dst)[l] = __float2half(block_vals[iqs + l]);
-        } else if constexpr (std::is_same_v<T, float>) {
-            ((float *) dst)[l] = block_vals[iqs + l];
+    if constexpr (std::is_same_v<T, half>) {
+        ((half *) dst)[0] = __float2half(r0);
+        ((half *) dst)[1] = __float2half(r1);
+        if constexpr (ne == 4) {
+            ((half *) dst)[2] = __float2half(r2);
+            ((half *) dst)[3] = __float2half(r3);
+        }
+    } else if constexpr (std::is_same_v<T, float>) {
+        ((float *) dst)[0] = r0;
+        ((float *) dst)[1] = r1;
+        if constexpr (ne == 4) {
+            ((float *) dst)[2] = r2;
+            ((float *) dst)[3] = r3;
         }
     }
 }
 
-// TurboQuant 4-bit K vec_dot with full QJL reconstruction.
-// Iterates per-block: reconstruct QJL once (noinline), then dot-product with Q.
+// TurboQuant 4-bit K vec_dot — warp-cooperative QJL via warp shuffles.
+// After FWHT, thread t has K[4t..4t+3]. The FA Q layout has different
+// stride, so we redistribute K values via __shfl_sync to match.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -695,27 +708,58 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
     float sum = 0.0f;
 
-    // Iterate per-block: reconstruct QJL once, then process all elements
     constexpr int n_blocks = D / QK_TURBO4;
 
-    for (int ib = 0; ib < n_blocks; ib++) {
-        float block_vals[128];
-        turbo4_dequant_block_qjl(&K_turbo4[ib], block_vals);
-
-        // Process pairs within this block, matching the standard FA indexing
 #pragma unroll
-        for (int j_base = 0; j_base < QK_TURBO4/2; j_base += nthreads) {
-            const int j_pair = j_base + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-            if (j_pair >= QK_TURBO4/2) break;
+    for (int ib = 0; ib < n_blocks; ib++) {
+        // Warp-cooperative QJL reconstruction — 4 registers per thread
+        float r0, r1, r2, r3;
+        turbo4_warp_dequant_block(&K_turbo4[ib], r0, r1, r2, r3, lane);
 
-            const int j0 = j_pair * 2;
-            const float2 K_val = make_float2(block_vals[j0], block_vals[j0 + 1]);
+        // Redistribute: thread lane needs K[2*lane] and K[2*lane+1] for sub-iter 0,
+        // and K[64+2*lane], K[64+2*lane+1] for sub-iter 1.
+        // K[2*lane] is at thread lane/2: reg r0 if lane even, r2 if lane odd.
+        // Use __shfl_sync to read from the source thread.
 
-            // Q_v index: global pair position, same stride pattern as other types
-            const int global_k_KQ_0 = ib * (QK_TURBO4/2) + j_base;
-            ggml_cuda_mad(sum, K_val, ((const float2 *) Q_v)[global_k_KQ_0/nthreads]);
+        // Sub-iteration 0: elements 0..63 of block
+        {
+            const float from_r0 = __shfl_sync(0xFFFFFFFF, r0, lane / 2);
+            const float from_r2 = __shfl_sync(0xFFFFFFFF, r2, lane / 2);
+            const float val0 = (lane & 1) ? from_r2 : from_r0;
+
+            const float from_r1 = __shfl_sync(0xFFFFFFFF, r1, lane / 2);
+            const float from_r3 = __shfl_sync(0xFFFFFFFF, r3, lane / 2);
+            const float val1 = (lane & 1) ? from_r3 : from_r1;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 q_h2 = ((const half2 *) Q_v)[ib * 2 + 0];
+            sum += val0 * __half2float(q_h2.x) + val1 * __half2float(q_h2.y);
+#else
+            const float2 q_f2 = ((const float2 *) Q_v)[ib * 2 + 0];
+            sum += val0 * q_f2.x + val1 * q_f2.y;
+#endif
+        }
+
+        // Sub-iteration 1: elements 64..127 of block
+        {
+            const float from_r0 = __shfl_sync(0xFFFFFFFF, r0, 16 + lane / 2);
+            const float from_r2 = __shfl_sync(0xFFFFFFFF, r2, 16 + lane / 2);
+            const float val0 = (lane & 1) ? from_r2 : from_r0;
+
+            const float from_r1 = __shfl_sync(0xFFFFFFFF, r1, 16 + lane / 2);
+            const float from_r3 = __shfl_sync(0xFFFFFFFF, r3, 16 + lane / 2);
+            const float val1 = (lane & 1) ? from_r3 : from_r1;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 q_h2 = ((const half2 *) Q_v)[ib * 2 + 1];
+            sum += val0 * __half2float(q_h2.x) + val1 * __half2float(q_h2.y);
+#else
+            const float2 q_f2 = ((const float2 *) Q_v)[ib * 2 + 1];
+            sum += val0 * q_f2.x + val1 * q_f2.y;
+#endif
         }
     }
 

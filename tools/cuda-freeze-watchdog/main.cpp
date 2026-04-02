@@ -30,8 +30,10 @@ static void on_shutdown(int sig) { (void)sig; g_shutdown = 1; }
 static void on_sigchld(int sig) {
     (void)sig;
     int status;
-    waitpid(-1, &status, WNOHANG);
-    if (g_child_pid > 0) {
+    // Reap any child, but only shutdown if it's the llama-server child.
+    // cuda-checkpoint fork/exec children also trigger SIGCHLD.
+    pid_t pid = waitpid(-1, &status, WNOHANG);
+    if (pid == g_child_pid) {
         fprintf(stderr, "[watchdog] child %d exited (status %d)\n",
                 g_child_pid, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         g_shutdown = 1;

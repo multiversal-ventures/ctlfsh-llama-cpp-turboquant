@@ -3,6 +3,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "cuda-checkpoint.h"
 
 #include "common.h"
 #include "llama.h"
@@ -587,6 +588,7 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+    bool frozen   = false;
 
     void destroy() {
         llama_init.reset();
@@ -606,6 +608,31 @@ private:
     }
 
     void handle_sleeping_state(bool new_state) {
+        if (params_base.cuda_freeze) {
+            if (new_state && !frozen) {
+                SRV_INF("cuda-freeze: freezing (pid %d)\n", (int)getpid());
+                int ret = run_cuda_checkpoint("lock", getpid());
+                if (ret == 0) {
+                    frozen = true;
+                    // Signal watchdog parent that we're frozen
+                    pid_t ppid = getppid();
+                    if (ppid > 1) {
+                        kill(ppid, SIGUSR1);
+                    }
+                    SRV_INF("%s", "cuda-freeze: frozen successfully\n");
+                } else {
+                    SRV_ERR("cuda-freeze: lock failed (ret=%d)\n", ret);
+                }
+            }
+            // After external thaw, execution resumes here. Reset frozen flag.
+            if (!new_state && frozen) {
+                frozen = false;
+                SRV_INF("%s", "cuda-freeze: thawed by watchdog\n");
+            }
+            sleeping = new_state;
+            return;
+        }
+        // Original behavior when --cuda-freeze not set
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
             SRV_INF("%s", "server is entering sleeping state\n");

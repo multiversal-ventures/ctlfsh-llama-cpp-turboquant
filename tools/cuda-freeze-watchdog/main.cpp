@@ -101,25 +101,52 @@ static long proxy_fds(int client_fd, int backend_fd) {
     fds[0].fd = client_fd;  fds[0].events = POLLIN;
     fds[1].fd = backend_fd; fds[1].events = POLLIN;
     char buf[8192];
+    int client_done = 0;
 
     while (1) {
-        int ret = poll(fds, 2, 60000);
+        int ret = poll(fds, 2, 120000);
         if (ret <= 0) break;
 
+        // Client → backend (request body)
         if (fds[0].revents & POLLIN) {
             int n = read(client_fd, buf, sizeof(buf));
-            if (n <= 0) break;
-            write(backend_fd, buf, n);
-            total += n;
+            if (n <= 0) {
+                // Client done sending — half-close to backend
+                shutdown(backend_fd, SHUT_WR);
+                client_done = 1;
+                fds[0].fd = -1; // stop polling client
+            } else {
+                write(backend_fd, buf, n);
+                total += n;
+            }
         }
+
+        // Backend → client (response)
         if (fds[1].revents & POLLIN) {
             int n = read(backend_fd, buf, sizeof(buf));
-            if (n <= 0) break;
+            if (n <= 0) break; // backend done = response complete
             write(client_fd, buf, n);
             total += n;
         }
-        if (fds[0].revents & (POLLHUP | POLLERR)) break;
-        if (fds[1].revents & (POLLHUP | POLLERR)) break;
+
+        // Client hung up — stop reading client but keep reading backend
+        if (!client_done && (fds[0].revents & (POLLHUP | POLLERR))) {
+            shutdown(backend_fd, SHUT_WR);
+            client_done = 1;
+            fds[0].fd = -1;
+        }
+
+        // Backend hung up or errored — we're done
+        if (fds[1].revents & (POLLHUP | POLLERR)) {
+            // Drain any remaining data
+            while (1) {
+                int n = read(backend_fd, buf, sizeof(buf));
+                if (n <= 0) break;
+                write(client_fd, buf, n);
+                total += n;
+            }
+            break;
+        }
     }
     return total;
 }

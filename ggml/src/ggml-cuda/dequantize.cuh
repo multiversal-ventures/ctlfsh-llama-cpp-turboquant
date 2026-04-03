@@ -145,3 +145,60 @@ static __device__ __forceinline__ void dequantize_turbo4_0(const void * vx, cons
 
     GGML_UNUSED(rnorm);
 }
+
+// turbo_split: asymmetric 2-bit regular + 3-bit outlier KV quant, QK=128
+// Per-element dequant for the non-FA mul_mat path
+static const __device__ float TURBO_CENTROIDS_2BIT_DEQUANT[4] = {
+    -0.133494f, -0.040023f, 0.040023f, 0.133494f
+};
+
+#define QR_TURBO_SPLIT 1
+#define QI_TURBO_SPLIT (QK_TURBO_SPLIT / (2 * QR_TURBO_SPLIT))
+
+static __device__ __forceinline__ void dequantize_turbo_split_0(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_turbo_split_0 * x = (const block_turbo_split_0 *) vx;
+    const float norm = __half2float(x[ib].norm);
+
+    const int j0 = iqs;
+    const int j1 = iqs + 1;
+
+    // Read 128-bit outlier mask as 4 uint32_t words
+    uint32_t mask_words[4];
+    memcpy(mask_words, x[ib].outlier_mask, 16);
+
+    float vals[2];
+    int channels[2] = {j0, j1};
+
+    for (int c = 0; c < 2; c++) {
+        int j = channels[c];
+        int word = j / 32;
+        int bit = j % 32;
+        bool is_outlier = (mask_words[word] >> bit) & 1;
+
+        if (is_outlier) {
+            // Count outlier bits before position j using __popc
+            int o_idx = 0;
+            for (int w = 0; w < word; w++) o_idx += __popc(mask_words[w]);
+            o_idx += __popc(mask_words[word] & ((1u << bit) - 1));
+
+            // Unpack 3-bit from qs_outlier
+            int bo = o_idx * 3;
+            uint16_t raw;
+            memcpy(&raw, &x[ib].qs_outlier[bo / 8], sizeof(uint16_t));
+            uint8_t idx = (raw >> (bo % 8)) & 0x7;
+            vals[c] = TURBO_CENTROIDS_3BIT_DEQUANT[idx] * norm;
+        } else {
+            // regular_bits_before_j = j - outlier_bits_before_j
+            int r_idx = j;
+            for (int w = 0; w < word; w++) r_idx -= __popc(mask_words[w]);
+            r_idx -= __popc(mask_words[word] & ((1u << bit) - 1));
+
+            // Unpack 2-bit from qs_regular (4 per byte)
+            uint8_t idx = (x[ib].qs_regular[r_idx / 4] >> ((r_idx % 4) * 2)) & 0x3;
+            vals[c] = TURBO_CENTROIDS_2BIT_DEQUANT[idx] * norm;
+        }
+    }
+
+    v.x = vals[0];
+    v.y = vals[1];
+}

@@ -770,6 +770,52 @@ static void dequantize_row_turbo4_0_cuda(const void * vx, dst_t * y, const int64
     dequantize_block_turbo4_0<<<grid_size, block_size, 0, stream>>>(vx, y, k);
 }
 
+// turbo_split: asymmetric 2-bit regular + 3-bit outlier KV quant
+static const __device__ float turbo_centroids_2bit_convert[4] = {
+    -0.133494f, -0.040023f, 0.040023f, 0.133494f
+};
+
+template<typename dst_t>
+static __global__ void dequantize_block_turbo_split_0(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= k) return;
+    const int64_t ib = i / QK_TURBO_SPLIT;
+    const int     j  = i % QK_TURBO_SPLIT;
+    const block_turbo_split_0 * x = (const block_turbo_split_0 *) vx;
+    const float norm = __half2float(x[ib].norm);
+
+    uint32_t mask_words[4];
+    memcpy(mask_words, x[ib].outlier_mask, 16);
+
+    int word = j / 32;
+    int bit = j % 32;
+    bool is_outlier = (mask_words[word] >> bit) & 1;
+
+    if (is_outlier) {
+        int o_idx = 0;
+        for (int w = 0; w < word; w++) o_idx += __popc(mask_words[w]);
+        o_idx += __popc(mask_words[word] & ((1u << bit) - 1));
+        int bo = o_idx * 3;
+        uint16_t raw;
+        memcpy(&raw, &x[ib].qs_outlier[bo / 8], sizeof(uint16_t));
+        uint8_t idx = (raw >> (bo % 8)) & 0x7;
+        y[i] = ggml_cuda_cast<dst_t>(turbo_centroids_3bit_convert[idx] * norm);
+    } else {
+        int r_idx = j;
+        for (int w = 0; w < word; w++) r_idx -= __popc(mask_words[w]);
+        r_idx -= __popc(mask_words[word] & ((1u << bit) - 1));
+        uint8_t idx = (x[ib].qs_regular[r_idx / 4] >> ((r_idx % 4) * 2)) & 0x3;
+        y[i] = ggml_cuda_cast<dst_t>(turbo_centroids_2bit_convert[idx] * norm);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo_split_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = (k + block_size - 1) / block_size;
+    dequantize_block_turbo_split_0<<<grid_size, block_size, 0, stream>>>(vx, y, k);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -836,6 +882,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_turbo3_0_cuda;
         case GGML_TYPE_TURBO4_0:
             return dequantize_row_turbo4_0_cuda;
+        case GGML_TYPE_TURBO_SPLIT_0:
+            return dequantize_row_turbo_split_0_cuda;
         default:
             return nullptr;
     }
@@ -893,6 +941,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_turbo3_0_cuda;
         case GGML_TYPE_TURBO4_0:
             return dequantize_row_turbo4_0_cuda;
+        case GGML_TYPE_TURBO_SPLIT_0:
+            return dequantize_row_turbo_split_0_cuda;
         default:
             return nullptr;
     }

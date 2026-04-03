@@ -895,38 +895,48 @@ static __device__ __forceinline__ void dequantize_V_turbo_split_0(const void * _
 
     const float norm = __half2float(x[ib].norm);
 
-    uint32_t mask_words[4];
-    memcpy(mask_words, x[ib].outlier_mask, 16);
+    // DIAGNOSTIC A: printf for first block, first lane, first call
+    static __device__ int diag_printed_v = 0;
+    if (ib == 0 && lane == 0 && atomicAdd(&diag_printed_v, 1) == 0) {
+        uint32_t mw[4];
+        memcpy(mw, x[ib].outlier_mask, 16);
+        printf("SPLIT_V_DIAG: i0=%lld ib=%lld lane=%d norm=%f mask=%08x_%08x_%08x_%08x\n",
+               (long long)i0, (long long)ib, lane, norm, mw[3], mw[2], mw[1], mw[0]);
+        printf("SPLIT_V_DIAG: qs_outlier[0..5]=%02x %02x %02x %02x %02x %02x\n",
+               x[ib].qs_outlier[0], x[ib].qs_outlier[1], x[ib].qs_outlier[2],
+               x[ib].qs_outlier[3], x[ib].qs_outlier[4], x[ib].qs_outlier[5]);
+        printf("SPLIT_V_DIAG: qs_regular[0..5]=%02x %02x %02x %02x %02x %02x\n",
+               x[ib].qs_regular[0], x[ib].qs_regular[1], x[ib].qs_regular[2],
+               x[ib].qs_regular[3], x[ib].qs_regular[4], x[ib].qs_regular[5]);
+    }
 
+    // DIAGNOSTIC B: bypass split — read ALL channels as contiguous 3-bit
+    // from qs_outlier[12] + qs_regular[36] = 48 bytes, treat as one buffer
+    // Channels 0-31 from qs_outlier (first 32*3=96 bits = 12 bytes)
+    // Channels 32-127 from qs_regular (next 96*3=288 bits = 36 bytes)
+    // With fixed mask (0-31 outlier), o_idx=j for j<32, r_idx=j-32 for j>=32
+    // This is equivalent to contiguous packing.
     static_assert(ne == 2 || ne == 4, "bad ne");
 
     float regs[4];
 #pragma unroll
     for (int l = 0; l < 4; l++) {
-        const int j    = base + l;
-        const int word = j / 32;
-        const int bit  = j % 32;
-        const bool is_outlier = (mask_words[word] >> bit) & 1;
-
-        if (is_outlier) {
-            int o_idx = 0;
-            for (int w = 0; w < word; w++) o_idx += __popc(mask_words[w]);
-            o_idx += __popc(mask_words[word] & ((1u << bit) - 1));
-            int bo = o_idx * 3;
+        const int j = base + l;
+        uint8_t idx;
+        if (j < 32) {
+            // Read from qs_outlier — channel j maps to position j
+            int bo = j * 3;
             uint16_t raw;
             memcpy(&raw, &x[ib].qs_outlier[bo / 8], sizeof(uint16_t));
-            uint8_t idx = (raw >> (bo % 8)) & 0x7;
-            regs[l] = TURBO_CENTROIDS_3BIT[idx] * norm;
+            idx = (raw >> (bo % 8)) & 0x7;
         } else {
-            int r_idx = j;
-            for (int w = 0; w < word; w++) r_idx -= __popc(mask_words[w]);
-            r_idx -= __popc(mask_words[word] & ((1u << bit) - 1));
-            int bo = r_idx * 3;
+            // Read from qs_regular — channel j maps to position j-32
+            int bo = (j - 32) * 3;
             uint16_t raw;
             memcpy(&raw, &x[ib].qs_regular[bo / 8], sizeof(uint16_t));
-            uint8_t idx = (raw >> (bo % 8)) & 0x7;
-            regs[l] = TURBO_CENTROIDS_3BIT[idx] * norm;
+            idx = (raw >> (bo % 8)) & 0x7;
         }
+        regs[l] = TURBO_CENTROIDS_3BIT[idx] * norm;
     }
 
     if constexpr (std::is_same_v<T, half>) {
@@ -977,26 +987,21 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split_0(
             const int bit  = j % 32;
             const bool is_outlier = (mask_words[word] >> bit) & 1;
 
+            // DIAGNOSTIC B: bypass split — direct contiguous read
             float val;
-            if (is_outlier) {
-                int o_idx = 0;
-                for (int w = 0; w < word; w++) o_idx += __popc(mask_words[w]);
-                o_idx += __popc(mask_words[word] & ((1u << bit) - 1));
-                int bo = o_idx * 3;
+            uint8_t idx;
+            if (j < 32) {
+                int bo = j * 3;
                 uint16_t raw;
                 memcpy(&raw, &K_split[ib].qs_outlier[bo / 8], sizeof(uint16_t));
-                uint8_t idx = (raw >> (bo % 8)) & 0x7;
-                val = TURBO_CENTROIDS_3BIT[idx] * norm;
+                idx = (raw >> (bo % 8)) & 0x7;
             } else {
-                int r_idx = j;
-                for (int w = 0; w < word; w++) r_idx -= __popc(mask_words[w]);
-                r_idx -= __popc(mask_words[word] & ((1u << bit) - 1));
-                int bo = r_idx * 3;
+                int bo = (j - 32) * 3;
                 uint16_t raw;
                 memcpy(&raw, &K_split[ib].qs_regular[bo / 8], sizeof(uint16_t));
-                uint8_t idx = (raw >> (bo % 8)) & 0x7;
-                val = TURBO_CENTROIDS_3BIT[idx] * norm;
+                idx = (raw >> (bo % 8)) & 0x7;
             }
+            val = TURBO_CENTROIDS_3BIT[idx] * norm;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             // Q_v is half2 array: element j is at index ib*QK_TURBO_SPLIT + j, packed as half2

@@ -63,7 +63,22 @@ static __global__ void k_set_rows_turbo3(
     block_turbo3_0 * dst_row_ptr = (block_turbo3_0 *)((char *)dst + dst_row*nb1 + i02*nb2 + i03*nb3);
     block_turbo3_0 * dst_grp = dst_row_ptr + i_grp * (QK_TURBO3_GROUP / QK_TURBO3);
 
+    // DEBUG: dump first group's input and quantized output
+    if (i == 0) {
+        printf("TURBO3_DEBUG set_rows: ne00=%lld groups_per_row=%lld\n", (long long)ne00, (long long)groups_per_row);
+        printf("TURBO3_DEBUG src[0..3]: %f %f %f %f\n", src_grp[0], src_grp[1], src_grp[2], src_grp[3]);
+    }
+
     quantize_f32_turbo3_0_group(src_grp, dst_grp);
+
+    if (i == 0) {
+        // Read back: dequant first 4 elements
+        float norm = __half2float(dst_grp[0].norm);
+        uint8_t low2_0 = (dst_grp[0].qs[0] >> 0) & 0x3;
+        uint8_t hi1_0 = (dst_grp[0].signs[0] >> 0) & 0x1;
+        uint8_t idx0 = low2_0 | (hi1_0 << 2);
+        printf("TURBO3_DEBUG quant: norm=%f idx[0]=%d centroid=%f\n", norm, idx0, TURBO_CENTROIDS_3BIT[idx0] * norm);
+    }
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne11);

@@ -75,7 +75,18 @@ static __global__ void k_get_rows_turbo3(
                 buf[j] = TURBO_CENTROIDS_3BIT_DEQUANT[idx] * norm;
             }
 
+            // DEBUG: print before/after inverse WHT for first group
+            if (ig == 0 && blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
+                printf("TURBO3_DEBUG get_rows BEFORE inverse: buf[0..3]=%f %f %f %f norm=%f\n",
+                    buf[0], buf[1], buf[2], buf[3], __half2float(src0_row[0].norm));
+            }
+
             turbo_rotate_inverse(buf);
+
+            if (ig == 0 && blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
+                printf("TURBO3_DEBUG get_rows AFTER inverse:  buf[0..3]=%f %f %f %f\n",
+                    buf[0], buf[1], buf[2], buf[3]);
+            }
 
             for (int j = 0; j < 128; j++) {
                 dst_row[group_start + j] = ggml_cuda_cast<dst_t>(buf[j]);

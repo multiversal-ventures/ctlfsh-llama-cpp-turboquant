@@ -2070,25 +2070,23 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens) — ne[0] divisible by 128
     // No reshape/cont/matmul needed — the custom kernel handles groups internally
-    // DISABLED: testing dequant-side rotation (see TODO line 1803)
-    // if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
-    //     if (q->ne[0] % 128 == 0) {
-    //         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-    //         q = ggml_turbo_wht(ctx0, q, 0);  // 0 = forward
-    //     }
-    // }
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO_SPLIT_0) {
+        if (q->ne[0] % 128 == 0) {
+            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+            q = ggml_turbo_wht(ctx0, q, 0);  // 0 = forward
+        }
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation: O(d log d) inverse WHT on attention output
-    // DISABLED: testing dequant-side rotation (see TODO line 1803)
-    // if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
-    //     if (cur->ne[0] % 128 == 0) {
-    //         if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-    //         cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
-    //     }
-    // }
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO_SPLIT_0) {
+        if (cur->ne[0] % 128 == 0) {
+            if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
+        }
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
@@ -2171,25 +2169,23 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     // TurboQuant pre-rotate-queries (attn_k path)
-    // DISABLED: testing dequant-side rotation (see TODO line 1803)
-    // if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
-    //     if (q->ne[0] % 128 == 0) {
-    //         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-    //         q = ggml_turbo_wht(ctx0, q, 0);
-    //     }
-    // }
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO_SPLIT_0) {
+        if (q->ne[0] % 128 == 0) {
+            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+            q = ggml_turbo_wht(ctx0, q, 0);
+        }
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation (attn_k path)
-    // DISABLED: testing dequant-side rotation (see TODO line 1803)
-    // if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
-    //     if (cur->ne[0] % 128 == 0) {
-    //         if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-    //         cur = ggml_turbo_wht(ctx0, cur, 1);
-    //     }
-    // }
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO_SPLIT_0) {
+        if (cur->ne[0] % 128 == 0) {
+            if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+            cur = ggml_turbo_wht(ctx0, cur, 1);
+        }
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
@@ -2256,25 +2252,23 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant pre-rotate-queries (ISWA path)
-    // DISABLED: testing dequant-side rotation (see TODO line 1803)
-    // if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
-    //     if (q->ne[0] % 128 == 0) {
-    //         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-    //         q = ggml_turbo_wht(ctx0, q, 0);  // forward WHT on query
-    //     }
-    // }
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO_SPLIT_0) {
+        if (q->ne[0] % 128 == 0) {
+            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+            q = ggml_turbo_wht(ctx0, q, 0);  // forward WHT on query
+        }
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation (ISWA path)
-    // DISABLED: testing dequant-side rotation (see TODO line 1803)
-    // if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
-    //     if (cur->ne[0] % 128 == 0) {
-    //         if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-    //         cur = ggml_turbo_wht(ctx0, cur, 1);  // inverse WHT on output
-    //     }
-    // }
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO_SPLIT_0) {
+        if (cur->ne[0] % 128 == 0) {
+            if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+            cur = ggml_turbo_wht(ctx0, cur, 1);  // inverse WHT on output
+        }
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur);

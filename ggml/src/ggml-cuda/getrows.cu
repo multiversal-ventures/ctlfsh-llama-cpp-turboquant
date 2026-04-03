@@ -154,6 +154,65 @@ static __global__ void k_get_rows_turbo4(
     }
 }
 
+// TurboSplit get_rows: dual-codebook dequant (outlier=3bit, regular=2bit)
+// One thread per 128-element block (one block_turbo_split_0)
+template<typename dst_t>
+static __global__ void k_get_rows_turbo_split(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00,
+        const int64_t ne11, const int64_t ne12,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+        for (int64_t ig = blockIdx.y*blockDim.x + threadIdx.x; ig < ne00/QK_TURBO_SPLIT; ig += gridDim.y*blockDim.x) {
+            const int i10 = blockIdx.x;
+            const int i11 = z / ne12;
+            const int i12 = z % ne12;
+
+            const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+            dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+            const block_turbo_split_0 * blk = (const block_turbo_split_0 *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03) + ig;
+
+            const float norm = __half2float(blk->norm);
+
+            uint32_t mask_words[4];
+            memcpy(mask_words, blk->outlier_mask, 16);
+
+            float buf[QK_TURBO_SPLIT];
+            int o_idx = 0, r_idx = 0;
+            for (int j = 0; j < QK_TURBO_SPLIT; j++) {
+                const int word = j / 32;
+                const int bit  = j % 32;
+                const bool is_outlier = (mask_words[word] >> bit) & 1;
+
+                if (is_outlier) {
+                    const int bo = o_idx * 3;
+                    uint16_t raw;
+                    memcpy(&raw, &blk->qs_outlier[bo / 8], sizeof(uint16_t));
+                    const uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                    buf[j] = TURBO_CENTROIDS_3BIT[idx] * norm;
+                    o_idx++;
+                } else {
+                    const uint8_t idx = (blk->qs_regular[r_idx / 4] >> ((r_idx % 4) * 2)) & 0x3;
+                    buf[j] = TURBO_CENTROIDS_2BIT[idx] * norm;
+                    r_idx++;
+                }
+            }
+
+            // Inverse WHT rotation
+            turbo_rotate_inverse(buf);
+
+            const int64_t group_start = ig * QK_TURBO_SPLIT;
+            for (int j = 0; j < QK_TURBO_SPLIT; j++) {
+                dst_row[group_start + j] = ggml_cuda_cast<dst_t>(buf[j]);
+            }
+        }
+    }
+}
+
 template<typename src0_t, typename dst_t>
 static __global__ void k_get_rows_float(
         const src0_t * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -319,6 +378,30 @@ static void get_rows_cuda_turbo4(
         s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
 }
 
+template<typename dst_t>
+static void get_rows_cuda_turbo_split(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    const size_t s1 = nb1/sizeof(dst_t);
+    const size_t s2 = nb2/sizeof(dst_t);
+    const size_t s3 = nb3/sizeof(dst_t);
+    const size_t s10 = nb10/sizeof(int32_t);
+    const size_t s11 = nb11/sizeof(int32_t);
+    const size_t s12 = nb12/sizeof(int32_t);
+
+    const int n_groups = ne00 / QK_TURBO_SPLIT;
+    const int block_dim = 32;
+    const dim3 grid(ne10, (n_groups + block_dim - 1) / block_dim, ne11*ne12);
+
+    k_get_rows_turbo_split<<<grid, block_dim, 0, stream>>>(
+        src0_d, src1_d, dst_d, ne00, ne11, ne12,
+        s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+}
+
 template <typename dst_t>
 static void ggml_cuda_get_rows_switch_src0_type(
         const void * src0_d, const ggml_type src0_type, const int32_t * src1_d, dst_t * dst_d,
@@ -369,6 +452,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
             break;
         case GGML_TYPE_TURBO4_0:
             get_rows_cuda_turbo4(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_TURBO_SPLIT_0:
+            get_rows_cuda_turbo_split(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:

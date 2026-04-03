@@ -303,8 +303,9 @@ typedef struct {
     uint8_t    outlier_mask[16]; // 16 bytes: 128-bit bitmask, bit i set = channel i is outlier
     uint8_t    qs_outlier[12];   // 12 bytes: 32 x 3-bit indices, bit-packed contiguously
     uint8_t    qs_regular[36];   // 36 bytes: 96 x 3-bit indices, bit-packed contiguously
-} block_turbo_split_0;           // 66 bytes per 128 values
-static_assert(sizeof(block_turbo_split_0) == sizeof(ggml_half) + 16 + 12 + 36,
+    uint8_t    padding[2];       //  2 bytes: pad to 68 (4-byte aligned, matches turbo4 size)
+} block_turbo_split_0;           // 68 bytes per 128 values
+static_assert(sizeof(block_turbo_split_0) == sizeof(ggml_half) + 16 + 12 + 36 + 2,
               "wrong turbo_split_0 block size/padding");
 
 //

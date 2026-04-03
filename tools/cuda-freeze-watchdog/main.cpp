@@ -98,6 +98,16 @@ static int wait_for_health(int timeout_ms) {
 
 // --- proxy ---
 
+// Write all bytes, retrying on partial writes
+static void write_all(int fd, const char * buf, int len) {
+    int written = 0;
+    while (written < len) {
+        int n = write(fd, buf + written, len - written);
+        if (n <= 0) break;
+        written += n;
+    }
+}
+
 static long proxy_fds(int client_fd, int backend_fd) {
     long total = 0;
     struct pollfd fds[2];
@@ -114,12 +124,11 @@ static long proxy_fds(int client_fd, int backend_fd) {
         if (fds[0].revents & POLLIN) {
             int n = read(client_fd, buf, sizeof(buf));
             if (n <= 0) {
-                // Client done sending — half-close to backend
                 shutdown(backend_fd, SHUT_WR);
                 client_done = 1;
-                fds[0].fd = -1; // stop polling client
+                fds[0].fd = -1;
             } else {
-                write(backend_fd, buf, n);
+                write_all(backend_fd, buf, n);
                 total += n;
             }
         }
@@ -127,8 +136,8 @@ static long proxy_fds(int client_fd, int backend_fd) {
         // Backend → client (response)
         if (fds[1].revents & POLLIN) {
             int n = read(backend_fd, buf, sizeof(buf));
-            if (n <= 0) break; // backend done = response complete
-            write(client_fd, buf, n);
+            if (n <= 0) break;
+            write_all(client_fd, buf, n);
             total += n;
         }
 
@@ -139,13 +148,12 @@ static long proxy_fds(int client_fd, int backend_fd) {
             fds[0].fd = -1;
         }
 
-        // Backend hung up or errored — we're done
+        // Backend hung up — drain remaining data then exit
         if (fds[1].revents & (POLLHUP | POLLERR)) {
-            // Drain any remaining data
             while (1) {
                 int n = read(backend_fd, buf, sizeof(buf));
                 if (n <= 0) break;
-                write(client_fd, buf, n);
+                write_all(client_fd, buf, n);
                 total += n;
             }
             break;
@@ -312,6 +320,7 @@ int main(int argc, char ** argv) {
             proxy_fds(client_fd, bfd);
             fprintf(stderr, "[watchdog] request done (%ldms)\n", ms_since(&t0));
             close(bfd);
+            shutdown(client_fd, SHUT_WR);
             close(client_fd);
             _exit(0);
         }

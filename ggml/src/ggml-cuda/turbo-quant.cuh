@@ -222,7 +222,7 @@ static __device__ void quantize_f32_turbo4_0_block(
     }
     float norm = sqrtf(norm_sq);
     float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
-    dst->norm = __float2half(norm);
+    // norm stored after centroid loop (corrected for quantization magnitude loss)
 
     float x[128];
     for (int j = 0; j < 128; j++) {
@@ -238,9 +238,11 @@ static __device__ void quantize_f32_turbo4_0_block(
     for (int j = 0; j < QK_TURBO4 / 8; j++) dst->signs[j] = 0;
 
     float recon[128];
+    float recon_norm_sq = 0.0f;
     for (int j = 0; j < 128; j++) {
         uint8_t idx = turbo_nearest_centroid_3bit(x[j]);
         recon[j] = TURBO_CENTROIDS_3BIT[idx];
+        recon_norm_sq += recon[j] * recon[j];
 
         int bit_offset = j * 3;
         int byte_idx = bit_offset / 8;
@@ -251,10 +253,12 @@ static __device__ void quantize_f32_turbo4_0_block(
         }
     }
 
-    // Step 4: residual in ROTATED space (both x and recon are rotated)
-    // This differs from Metal which uses mixed space (normalized - recon).
-    // Rotated-space residual is compatible with pre-rotate-queries:
-    // dequant can reconstruct entirely in rotated space.
+    // Norm correction: centroid * corrected_norm has correct L2 norm (same as turbo3)
+    float recon_norm = sqrtf(recon_norm_sq);
+    float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+    dst->norm = __float2half(corrected_norm);
+
+    // Step 4: residual in ROTATED space
     float rnorm_sq = 0.0f;
     for (int j = 0; j < 128; j++) {
         x[j] = x[j] - recon[j];  // rotated - rotated = rotated residual

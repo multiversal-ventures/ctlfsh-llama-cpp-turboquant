@@ -115,8 +115,9 @@ static __device__ __forceinline__ void turbo4_warp_dequant_block(
     r3 *= TURBO_QJL_S1_FA[base + 3];
 
     // Step 5: Scale QJL residual by sqrt(pi/2)/d * rnorm (paper Eq. Algorithm 2 line 11)
+    // DIAGNOSTIC: QJL disabled to isolate whether it helps or hurts
     const float rnorm = __half2float(__ldg(&blk->rnorm));
-    const float qjl_scale = 1.2533141373155003f / 128.0f * rnorm;
+    const float qjl_scale = 0.0f; // 1.2533141373155003f / 128.0f * rnorm;
     r0 *= qjl_scale;
     r1 *= qjl_scale;
     r2 *= qjl_scale;

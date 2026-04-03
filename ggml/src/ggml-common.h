@@ -293,18 +293,18 @@ typedef struct {
 } block_turbo4_0;                       // 68 bytes total
 static_assert(sizeof(block_turbo4_0) == 2*sizeof(ggml_half) + QK_TURBO4*3/8 + QK_TURBO4/8, "wrong turbo4_0 block size/padding");
 
-// TurboQuant split: outlier-aware 32ch@3bit + 96ch@2bit
-// Per block: norm(fp16) + outlier_mask(16 bytes) + 3-bit outlier indices (12 bytes) + 2-bit regular indices (24 bytes)
-// = 54 bytes per 128 values = 3.375 bits/value → 4.7× compression vs fp16
+// TurboQuant split: outlier-aware 32ch@3bit + 96ch@3bit (approach B step 1)
+// Per block: norm(fp16) + outlier_mask(16 bytes) + 3-bit outlier indices (12 bytes) + 3-bit regular indices (36 bytes)
+// = 66 bytes per 128 values = 4.125 bits/value → 3.9× compression vs fp16
 #define QK_TURBO_SPLIT 128
 
 typedef struct {
     ggml_half  norm;             //  2 bytes: corrected L2 norm (grp_norm / recon_norm)
     uint8_t    outlier_mask[16]; // 16 bytes: 128-bit bitmask, bit i set = channel i is outlier
     uint8_t    qs_outlier[12];   // 12 bytes: 32 x 3-bit indices, bit-packed contiguously
-    uint8_t    qs_regular[24];   // 24 bytes: 96 x 2-bit indices, 4 per byte
-} block_turbo_split_0;           // 54 bytes per 128 values
-static_assert(sizeof(block_turbo_split_0) == sizeof(ggml_half) + 16 + 12 + 24,
+    uint8_t    qs_regular[36];   // 36 bytes: 96 x 3-bit indices, bit-packed contiguously
+} block_turbo_split_0;           // 66 bytes per 128 values
+static_assert(sizeof(block_turbo_split_0) == sizeof(ggml_half) + 16 + 12 + 36,
               "wrong turbo_split_0 block size/padding");
 
 //

@@ -312,13 +312,13 @@ static __device__ void quantize_f32_turbo_split_0_block(
         dst->outlier_mask[j / 8] |= (1u << (j % 8));
     }
 
-    // Step 4: quantize with dual codebook
-    // Outlier channels (top 32 by magnitude) → 3-bit (8 centroids, more precision)
-    // Regular channels (bottom 96) → 2-bit (4 centroids)
+    // Step 4: quantize — both outlier and regular use 3-bit (approach B step 1)
+    // Outlier channels (top 32 by magnitude) → 3-bit (8 centroids)
+    // Regular channels (bottom 96) → 3-bit (8 centroids, same codebook)
     float recon_norm_sq = 0.0f;
     int o_idx = 0, r_idx = 0;
     memset(dst->qs_outlier, 0, 12);
-    memset(dst->qs_regular, 0, 24);
+    memset(dst->qs_regular, 0, 36);
 
     for (int j = 0; j < 128; j++) {
         bool is_outlier = (dst->outlier_mask[j / 8] >> (j % 8)) & 1;
@@ -335,10 +335,16 @@ static __device__ void quantize_f32_turbo_split_0_block(
             recon_norm_sq += TURBO_CENTROIDS_3BIT[idx] * TURBO_CENTROIDS_3BIT[idx];
             o_idx++;
         } else {
-            uint8_t idx = turbo_nearest_centroid_2bit(x[j]);
-            // Pack 2-bit into qs_regular (4 per byte)
-            dst->qs_regular[r_idx / 4] |= (idx & 0x3) << ((r_idx % 4) * 2);
-            recon_norm_sq += TURBO_CENTROIDS_2BIT[idx] * TURBO_CENTROIDS_2BIT[idx];
+            uint8_t idx = turbo_nearest_centroid_3bit(x[j]);
+            // Pack 3-bit into qs_regular (bit-packed spanning byte boundaries)
+            int bo = r_idx * 3;
+            int byte_idx = bo / 8;
+            int bit_pos = bo % 8;
+            dst->qs_regular[byte_idx] |= (uint8_t)((idx & 0x7) << bit_pos);
+            if (bit_pos > 5 && byte_idx + 1 < 36) {
+                dst->qs_regular[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
+            }
+            recon_norm_sq += TURBO_CENTROIDS_3BIT[idx] * TURBO_CENTROIDS_3BIT[idx];
             r_idx++;
         }
     }

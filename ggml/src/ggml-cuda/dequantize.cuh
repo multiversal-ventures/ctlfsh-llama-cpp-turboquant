@@ -193,9 +193,12 @@ static __device__ __forceinline__ void dequantize_turbo_split_0(const void * vx,
             for (int w = 0; w < word; w++) r_idx -= __popc(mask_words[w]);
             r_idx -= __popc(mask_words[word] & ((1u << bit) - 1));
 
-            // Unpack 2-bit from qs_regular (4 per byte)
-            uint8_t idx = (x[ib].qs_regular[r_idx / 4] >> ((r_idx % 4) * 2)) & 0x3;
-            vals[c] = TURBO_CENTROIDS_2BIT_DEQUANT[idx] * norm;
+            // Unpack 3-bit from qs_regular (bit-packed, spanning byte boundaries)
+            int bo = r_idx * 3;
+            uint16_t raw;
+            memcpy(&raw, &x[ib].qs_regular[bo / 8], sizeof(uint16_t));
+            uint8_t idx = (raw >> (bo % 8)) & 0x7;
+            vals[c] = TURBO_CENTROIDS_3BIT_DEQUANT[idx] * norm;
         }
     }
 

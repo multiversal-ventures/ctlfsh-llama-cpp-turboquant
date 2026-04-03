@@ -196,8 +196,11 @@ static __global__ void k_get_rows_turbo_split(
                     buf[j] = TURBO_CENTROIDS_3BIT[idx] * norm;
                     o_idx++;
                 } else {
-                    const uint8_t idx = (blk->qs_regular[r_idx / 4] >> ((r_idx % 4) * 2)) & 0x3;
-                    buf[j] = TURBO_CENTROIDS_2BIT[idx] * norm;
+                    int bo = r_idx * 3;
+                    uint16_t raw;
+                    memcpy(&raw, &blk->qs_regular[bo / 8], sizeof(uint16_t));
+                    const uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                    buf[j] = TURBO_CENTROIDS_3BIT[idx] * norm;
                     r_idx++;
                 }
             }

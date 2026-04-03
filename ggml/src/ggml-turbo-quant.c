@@ -381,7 +381,7 @@ void quantize_row_turbo_split_0_ref(const float * GGML_RESTRICT x, block_turbo_s
         y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
         memset(y[i].outlier_mask, 0, 16);
         memset(y[i].qs_outlier, 0, 12);
-        memset(y[i].qs_regular, 0, 24);
+        memset(y[i].qs_regular, 0, 36);
     }
 }
 
@@ -405,8 +405,11 @@ void dequantize_row_turbo_split_0(const block_turbo_split_0 * GGML_RESTRICT x, f
                 y[block * QK_TURBO_SPLIT + j] = CENTROIDS_3BIT[idx] * norm;
                 outlier_idx++;
             } else {
-                uint8_t idx = (x[block].qs_regular[regular_idx / 4] >> ((regular_idx % 4) * 2)) & 0x3;
-                y[block * QK_TURBO_SPLIT + j] = CENTROIDS_2BIT[idx] * norm;
+                int bo = regular_idx * 3;
+                uint16_t raw;
+                memcpy(&raw, &x[block].qs_regular[bo / 8], sizeof(uint16_t));
+                uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                y[block * QK_TURBO_SPLIT + j] = CENTROIDS_3BIT[idx] * norm;
                 regular_idx++;
             }
         }

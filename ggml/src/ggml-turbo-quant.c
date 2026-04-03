@@ -369,3 +369,58 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     }
     return nrows * row_size;
 }
+
+// --- TurboSplit: outlier-aware 32ch@3bit + 96ch@2bit ---
+
+void quantize_row_turbo_split_0_ref(const float * GGML_RESTRICT x, block_turbo_split_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO_SPLIT == 0);
+    const int nb = k / QK_TURBO_SPLIT;
+    for (int i = 0; i < nb; i++) {
+        float norm = 0.0f;
+        for (int j = 0; j < QK_TURBO_SPLIT; j++) norm += x[i*QK_TURBO_SPLIT + j] * x[i*QK_TURBO_SPLIT + j];
+        y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
+        memset(y[i].outlier_mask, 0, 16);
+        memset(y[i].qs_outlier, 0, 12);
+        memset(y[i].qs_regular, 0, 24);
+    }
+}
+
+void dequantize_row_turbo_split_0(const block_turbo_split_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO_SPLIT == 0);
+    const int nb = k / QK_TURBO_SPLIT;
+    for (int block = 0; block < nb; block++) {
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        uint32_t mask_words[4];
+        memcpy(mask_words, x[block].outlier_mask, 16);
+        int outlier_idx = 0;
+        int regular_idx = 0;
+        for (int j = 0; j < QK_TURBO_SPLIT; j++) {
+            int word = j / 32;
+            int bit = j % 32;
+            if (mask_words[word] & (1u << bit)) {
+                int bo = outlier_idx * 3;
+                uint16_t raw;
+                memcpy(&raw, &x[block].qs_outlier[bo / 8], sizeof(uint16_t));
+                uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                y[block * QK_TURBO_SPLIT + j] = CENTROIDS_3BIT[idx] * norm;
+                outlier_idx++;
+            } else {
+                uint8_t idx = (x[block].qs_regular[regular_idx / 4] >> ((regular_idx % 4) * 2)) & 0x3;
+                y[block * QK_TURBO_SPLIT + j] = CENTROIDS_2BIT[idx] * norm;
+                regular_idx++;
+            }
+        }
+    }
+}
+
+size_t quantize_turbo_split_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                              int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO_SPLIT == 0);
+    size_t row_size = (n_per_row / QK_TURBO_SPLIT) * sizeof(block_turbo_split_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo_split_0_ref(src + row * n_per_row,
+            (block_turbo_split_0 *)((char *)dst + row * row_size), n_per_row);
+    }
+    return nrows * row_size;
+}

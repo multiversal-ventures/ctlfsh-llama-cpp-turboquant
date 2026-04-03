@@ -895,19 +895,18 @@ static __device__ __forceinline__ void dequantize_V_turbo_split_0(const void * _
 
     const float norm = __half2float(x[ib].norm);
 
-    // DIAGNOSTIC A: printf for first block, first lane, first call
-    static __device__ int diag_printed_v = 0;
-    if (ib == 0 && lane == 0 && atomicAdd(&diag_printed_v, 1) == 0) {
-        uint32_t mw[4];
-        memcpy(mw, x[ib].outlier_mask, 16);
-        printf("SPLIT_V_DIAG: i0=%lld ib=%lld lane=%d norm=%f mask=%08x_%08x_%08x_%08x\n",
-               (long long)i0, (long long)ib, lane, norm, mw[3], mw[2], mw[1], mw[0]);
-        printf("SPLIT_V_DIAG: qs_outlier[0..5]=%02x %02x %02x %02x %02x %02x\n",
-               x[ib].qs_outlier[0], x[ib].qs_outlier[1], x[ib].qs_outlier[2],
-               x[ib].qs_outlier[3], x[ib].qs_outlier[4], x[ib].qs_outlier[5]);
-        printf("SPLIT_V_DIAG: qs_regular[0..5]=%02x %02x %02x %02x %02x %02x\n",
-               x[ib].qs_regular[0], x[ib].qs_regular[1], x[ib].qs_regular[2],
-               x[ib].qs_regular[3], x[ib].qs_regular[4], x[ib].qs_regular[5]);
+    // DIAGNOSTIC A: printf — check addresses and values
+    if (ib == 0 && lane == 0) {
+        const char * base_ptr = (const char *)vx;
+        const char * blk_ptr = (const char *)&x[ib];
+        printf("SPLIT_V: vx=%p x[0]=%p x[1]=%p diff=%lld sizeof=%lu norm=%f\n",
+               vx, &x[0], &x[1], (long long)((const char*)&x[1] - (const char*)&x[0]),
+               (unsigned long)sizeof(block_turbo_split_0), norm);
+        // Print first 8 bytes of block raw
+        const uint8_t *raw = (const uint8_t *)&x[ib];
+        printf("SPLIT_V: raw[0..15]=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+               raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7],
+               raw[8],raw[9],raw[10],raw[11],raw[12],raw[13],raw[14],raw[15]);
     }
 
     // DIAGNOSTIC B: bypass split — read ALL channels as contiguous 3-bit

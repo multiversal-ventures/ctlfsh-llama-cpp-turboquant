@@ -650,9 +650,7 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __rest
     }
 }
 
-// TurboQuant 3-bit K vec_dot for flash attention
-// Uses float Q path (like bf16). Optimized: __ldg reads, batch 4 elements
-// per qs byte, reduced bit extraction overhead.
+// TurboQuant 3-bit K vec_dot for flash attention — with dequant-side inverse WHT
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -661,43 +659,88 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
     float sum = 0.0f;
 
-    // Process 2 elements per iteration (matching bf16 pattern)
-    // Each thread handles elements at k_KQ*2 and k_KQ*2+1
+    constexpr int n_groups = D / 128;  // rotation groups (128 elements each)
+
 #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+    for (int ig = 0; ig < n_groups; ig++) {
+        // Dequant 4 elements per thread (32 threads × 4 = 128)
+        float r0, r1, r2, r3;
+        {
+            const int base = ig * 128 + lane * 4;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int elem = base + l;
+                const int ib = elem / QK_TURBO3;
+                const int j  = elem % QK_TURBO3;
 
-        const int elem = k_KQ * 2;
-        const int ib   = elem / QK_TURBO3;
-        const int j0   = elem % QK_TURBO3;
+                const float norm = __half2float(__ldg(&K_turbo3[ib].norm));
+                const uint8_t low2 = (__ldg(&K_turbo3[ib].qs[j / 4]) >> ((j % 4) * 2)) & 0x3;
+                const uint8_t hi1  = (__ldg(&K_turbo3[ib].signs[j / 8]) >> (j % 8)) & 0x1;
+                const uint8_t idx  = low2 | (hi1 << 2);
+                float val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
+                if (l == 0) r0 = val; else if (l == 1) r1 = val;
+                else if (l == 2) r2 = val; else r3 = val;
+            }
+        }
 
-        // __ldg: read through texture cache (read-only K cache)
-        const float norm = __half2float(__ldg(&K_turbo3[ib].norm));
+        // Inverse WHT: signs2 → FWHT → 1/sqrt(128) * signs1
+        {
+            const int base = lane * 4;
+            r0 *= TURBO_WHT_SIGNS2[base + 0];
+            r1 *= TURBO_WHT_SIGNS2[base + 1];
+            r2 *= TURBO_WHT_SIGNS2[base + 2];
+            r3 *= TURBO_WHT_SIGNS2[base + 3];
 
-        // Read one qs byte covering elements j0 and j0+1 (consecutive even/odd pair)
-        // j0 is always even (elem = k_KQ*2), so j0 and j0+1 share the same qs byte
-        // when j0%4 is 0 or 2 (which it always is since j0 is even)
-        const uint8_t qb = __ldg(&K_turbo3[ib].qs[j0 / 4]);
-        const int shift = (j0 % 4) * 2;
-        const uint8_t low2_0 = (qb >> shift) & 0x3;
-        const uint8_t low2_1 = (qb >> (shift + 2)) & 0x3;
+            turbo4_warp_fwht(r0, r1, r2, r3, lane);
 
-        // Signs byte — j0 and j0+1 are in same byte when j0%8 < 7 (always for even j0 < 32)
-        const uint8_t sb = __ldg(&K_turbo3[ib].signs[j0 / 8]);
-        const uint8_t hi1_0 = (sb >> (j0 % 8)) & 0x1;
-        const uint8_t hi1_1 = (sb >> ((j0 + 1) % 8)) & 0x1;
+            const float inv = TURBO_INV_SQRT_128;
+            r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
+            r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
+            r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
+            r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
+        }
 
-        const float val0 = TURBO_CENTROIDS_3BIT_FA[low2_0 | (hi1_0 << 2)] * norm;
-        const float val1 = TURBO_CENTROIDS_3BIT_FA[low2_1 | (hi1_1 << 2)] * norm;
+        // Dot with Q — redistribute to match Q layout (2 elements per thread)
+        // Sub-iter 0: elements 0..63
+        {
+            const float from_r0 = __shfl_sync(0xFFFFFFFF, r0, lane / 2);
+            const float from_r2 = __shfl_sync(0xFFFFFFFF, r2, lane / 2);
+            const float val0 = (lane & 1) ? from_r2 : from_r0;
+
+            const float from_r1 = __shfl_sync(0xFFFFFFFF, r1, lane / 2);
+            const float from_r3 = __shfl_sync(0xFFFFFFFF, r3, lane / 2);
+            const float val1 = (lane & 1) ? from_r3 : from_r1;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
-        const half2 q_h2 = ((const half2 *) Q_v)[k_KQ_0/nthreads];
-        sum += val0 * __half2float(q_h2.x) + val1 * __half2float(q_h2.y);
+            const half2 q_h2 = ((const half2 *) Q_v)[ig * 2 + 0];
+            sum += val0 * __half2float(q_h2.x) + val1 * __half2float(q_h2.y);
 #else
-        ggml_cuda_mad(sum, make_float2(val0, val1), ((const float2 *) Q_v)[k_KQ_0/nthreads]);
+            const float2 q_f2 = ((const float2 *) Q_v)[ig * 2 + 0];
+            sum += val0 * q_f2.x + val1 * q_f2.y;
 #endif
+        }
+
+        // Sub-iter 1: elements 64..127
+        {
+            const float from_r0 = __shfl_sync(0xFFFFFFFF, r0, 16 + lane / 2);
+            const float from_r2 = __shfl_sync(0xFFFFFFFF, r2, 16 + lane / 2);
+            const float val0 = (lane & 1) ? from_r2 : from_r0;
+
+            const float from_r1 = __shfl_sync(0xFFFFFFFF, r1, 16 + lane / 2);
+            const float from_r3 = __shfl_sync(0xFFFFFFFF, r3, 16 + lane / 2);
+            const float val1 = (lane & 1) ? from_r3 : from_r1;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 q_h2 = ((const half2 *) Q_v)[ig * 2 + 1];
+            sum += val0 * __half2float(q_h2.x) + val1 * __half2float(q_h2.y);
+#else
+            const float2 q_f2 = ((const float2 *) Q_v)[ig * 2 + 1];
+            sum += val0 * q_f2.x + val1 * q_f2.y;
+#endif
+        }
     }
 
     return sum;
@@ -774,6 +817,23 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
         // Warp-cooperative QJL reconstruction — 4 registers per thread
         float r0, r1, r2, r3;
         turbo4_warp_dequant_block(&K_turbo4[ib], r0, r1, r2, r3, lane);
+
+        // Inverse WHT: un-rotate K from turbo space
+        {
+            const int base = lane * 4;
+            r0 *= TURBO_WHT_SIGNS2[base + 0];
+            r1 *= TURBO_WHT_SIGNS2[base + 1];
+            r2 *= TURBO_WHT_SIGNS2[base + 2];
+            r3 *= TURBO_WHT_SIGNS2[base + 3];
+
+            turbo4_warp_fwht(r0, r1, r2, r3, lane);
+
+            const float inv = TURBO_INV_SQRT_128;
+            r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
+            r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
+            r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
+            r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
+        }
 
         // Redistribute: thread lane needs K[2*lane] and K[2*lane+1] for sub-iter 0,
         // and K[64+2*lane], K[64+2*lane+1] for sub-iter 1.

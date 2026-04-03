@@ -895,47 +895,13 @@ static __device__ __forceinline__ void dequantize_V_turbo_split_0(const void * _
 
     const float norm = __half2float(x[ib].norm);
 
-    // DIAGNOSTIC A: printf — check addresses and values
-    if (ib == 0 && lane == 0) {
-        const char * base_ptr = (const char *)vx;
-        const char * blk_ptr = (const char *)&x[ib];
-        printf("SPLIT_V: vx=%p x[0]=%p x[1]=%p diff=%lld sizeof=%lu norm=%f\n",
-               vx, &x[0], &x[1], (long long)((const char*)&x[1] - (const char*)&x[0]),
-               (unsigned long)sizeof(block_turbo_split_0), norm);
-        // Print first 8 bytes of block raw
-        const uint8_t *raw = (const uint8_t *)&x[ib];
-        printf("SPLIT_V: raw[0..15]=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-               raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7],
-               raw[8],raw[9],raw[10],raw[11],raw[12],raw[13],raw[14],raw[15]);
-    }
-
-    // DIAGNOSTIC B: bypass split — read ALL channels as contiguous 3-bit
-    // from qs_outlier[12] + qs_regular[36] = 48 bytes, treat as one buffer
-    // Channels 0-31 from qs_outlier (first 32*3=96 bits = 12 bytes)
-    // Channels 32-127 from qs_regular (next 96*3=288 bits = 36 bytes)
-    // With fixed mask (0-31 outlier), o_idx=j for j<32, r_idx=j-32 for j>=32
-    // This is equivalent to contiguous packing.
+    // DIAGNOSTIC: just return norm for all channels (no data access beyond norm)
+    // If this still crashes, the block pointer itself is invalid
     static_assert(ne == 2 || ne == 4, "bad ne");
 
     float regs[4];
-#pragma unroll
     for (int l = 0; l < 4; l++) {
-        const int j = base + l;
-        uint8_t idx;
-        if (j < 32) {
-            // Read from qs_outlier — channel j maps to position j
-            int bo = j * 3;
-            uint16_t raw;
-            memcpy(&raw, &x[ib].qs_outlier[bo / 8], sizeof(uint16_t));
-            idx = (raw >> (bo % 8)) & 0x7;
-        } else {
-            // Read from qs_regular — channel j maps to position j-32
-            int bo = (j - 32) * 3;
-            uint16_t raw;
-            memcpy(&raw, &x[ib].qs_regular[bo / 8], sizeof(uint16_t));
-            idx = (raw >> (bo % 8)) & 0x7;
-        }
-        regs[l] = TURBO_CENTROIDS_3BIT[idx] * norm;
+        regs[l] = norm * 0.01f;  // small constant * norm, no qs access
     }
 
     if constexpr (std::is_same_v<T, half>) {
@@ -986,21 +952,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split_0(
             const int bit  = j % 32;
             const bool is_outlier = (mask_words[word] >> bit) & 1;
 
-            // DIAGNOSTIC B: bypass split — direct contiguous read
-            float val;
-            uint8_t idx;
-            if (j < 32) {
-                int bo = j * 3;
-                uint16_t raw;
-                memcpy(&raw, &K_split[ib].qs_outlier[bo / 8], sizeof(uint16_t));
-                idx = (raw >> (bo % 8)) & 0x7;
-            } else {
-                int bo = (j - 32) * 3;
-                uint16_t raw;
-                memcpy(&raw, &K_split[ib].qs_regular[bo / 8], sizeof(uint16_t));
-                idx = (raw >> (bo % 8)) & 0x7;
-            }
-            val = TURBO_CENTROIDS_3BIT[idx] * norm;
+            // DIAGNOSTIC: constant value, no qs access
+            float val = norm * 0.01f;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             // Q_v is half2 array: element j is at index ib*QK_TURBO_SPLIT + j, packed as half2

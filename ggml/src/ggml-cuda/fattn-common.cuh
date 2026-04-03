@@ -895,29 +895,39 @@ static __device__ __forceinline__ void dequantize_V_turbo_split_0(const void * _
 
     const float norm = __half2float(x[ib].norm);
 
-    // Restore working diagnostic B — contiguous read, no popcount
-    static_assert(ne == 2 || ne == 4, "bad ne");
-
+    // Original popcount-based dequant
     uint32_t mask_words[4];
     memcpy(mask_words, x[ib].outlier_mask, 16);
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
 
     float regs[4];
 #pragma unroll
     for (int l = 0; l < 4; l++) {
-        const int j = base + l;
-        uint8_t idx;
-        if (j < 32) {
-            int bo = j * 3;
+        const int j    = base + l;
+        const int word = j / 32;
+        const int bit  = j % 32;
+        const bool is_outlier = (mask_words[word] >> bit) & 1;
+
+        if (is_outlier) {
+            int o_idx = 0;
+            for (int w = 0; w < word; w++) o_idx += __popc(mask_words[w]);
+            o_idx += __popc(mask_words[word] & ((1u << bit) - 1));
+            int bo = o_idx * 3;
             uint16_t raw;
             memcpy(&raw, &x[ib].qs_outlier[bo / 8], sizeof(uint16_t));
-            idx = (raw >> (bo % 8)) & 0x7;
+            uint8_t idx = (raw >> (bo % 8)) & 0x7;
+            regs[l] = TURBO_CENTROIDS_3BIT[idx] * norm;
         } else {
-            int bo = (j - 32) * 3;
+            int r_idx = j;
+            for (int w = 0; w < word; w++) r_idx -= __popc(mask_words[w]);
+            r_idx -= __popc(mask_words[word] & ((1u << bit) - 1));
+            int bo = r_idx * 3;
             uint16_t raw;
             memcpy(&raw, &x[ib].qs_regular[bo / 8], sizeof(uint16_t));
-            idx = (raw >> (bo % 8)) & 0x7;
+            uint8_t idx = (raw >> (bo % 8)) & 0x7;
+            regs[l] = TURBO_CENTROIDS_3BIT[idx] * norm;
         }
-        regs[l] = TURBO_CENTROIDS_3BIT[idx] * norm;
     }
 
     if constexpr (std::is_same_v<T, half>) {
@@ -968,21 +978,27 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split_0(
             const int bit  = j % 32;
             const bool is_outlier = (mask_words[word] >> bit) & 1;
 
-            // Contiguous read — no popcount
+            // Original popcount-based dequant
             float val;
-            uint8_t idx;
-            if (j < 32) {
-                int bo = j * 3;
+            if (is_outlier) {
+                int o_idx = 0;
+                for (int w = 0; w < word; w++) o_idx += __popc(mask_words[w]);
+                o_idx += __popc(mask_words[word] & ((1u << bit) - 1));
+                int bo = o_idx * 3;
                 uint16_t raw;
                 memcpy(&raw, &K_split[ib].qs_outlier[bo / 8], sizeof(uint16_t));
-                idx = (raw >> (bo % 8)) & 0x7;
+                uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                val = TURBO_CENTROIDS_3BIT[idx] * norm;
             } else {
-                int bo = (j - 32) * 3;
+                int r_idx = j;
+                for (int w = 0; w < word; w++) r_idx -= __popc(mask_words[w]);
+                r_idx -= __popc(mask_words[word] & ((1u << bit) - 1));
+                int bo = r_idx * 3;
                 uint16_t raw;
                 memcpy(&raw, &K_split[ib].qs_regular[bo / 8], sizeof(uint16_t));
-                idx = (raw >> (bo % 8)) & 0x7;
+                uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                val = TURBO_CENTROIDS_3BIT[idx] * norm;
             }
-            val = TURBO_CENTROIDS_3BIT[idx] * norm;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             // Q_v is half2 array: element j is at index ib*QK_TURBO_SPLIT + j, packed as half2

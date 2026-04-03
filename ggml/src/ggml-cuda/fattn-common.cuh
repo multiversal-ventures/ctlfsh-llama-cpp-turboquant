@@ -882,6 +882,132 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     return sum;
 }
 
+// TurboQuant split-codebook V dequant for flash attention.
+// Each block is 128 elements: 32 outlier channels (3-bit) + 96 regular (2-bit).
+// Thread t is responsible for elements [4t..4t+3] within the block.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo_split_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo_split_0 * x = (const block_turbo_split_0 *) vx;
+
+    const int64_t ib   = i0 / QK_TURBO_SPLIT;
+    const int     lane = (i0 % QK_TURBO_SPLIT) / 4;  // 0..31
+    const int     base = lane * 4;                     // first channel this thread handles
+
+    const float norm = __half2float(x[ib].norm);
+
+    uint32_t mask_words[4];
+    memcpy(mask_words, x[ib].outlier_mask, 16);
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    float regs[4];
+#pragma unroll
+    for (int l = 0; l < 4; l++) {
+        const int j    = base + l;
+        const int word = j / 32;
+        const int bit  = j % 32;
+        const bool is_outlier = (mask_words[word] >> bit) & 1;
+
+        if (is_outlier) {
+            int o_idx = 0;
+            for (int w = 0; w < word; w++) o_idx += __popc(mask_words[w]);
+            o_idx += __popc(mask_words[word] & ((1u << bit) - 1));
+            int bo = o_idx * 3;
+            uint16_t raw;
+            memcpy(&raw, &x[ib].qs_outlier[bo / 8], sizeof(uint16_t));
+            uint8_t idx = (raw >> (bo % 8)) & 0x7;
+            regs[l] = TURBO_CENTROIDS_3BIT[idx] * norm;
+        } else {
+            int r_idx = j;
+            for (int w = 0; w < word; w++) r_idx -= __popc(mask_words[w]);
+            r_idx -= __popc(mask_words[word] & ((1u << bit) - 1));
+            uint8_t idx = (x[ib].qs_regular[r_idx / 4] >> ((r_idx % 4) * 2)) & 0x3;
+            regs[l] = TURBO_CENTROIDS_2BIT[idx] * norm;
+        }
+    }
+
+    if constexpr (std::is_same_v<T, half>) {
+        ((half *) dst)[0] = __float2half(regs[0]);
+        ((half *) dst)[1] = __float2half(regs[1]);
+        if constexpr (ne == 4) {
+            ((half *) dst)[2] = __float2half(regs[2]);
+            ((half *) dst)[3] = __float2half(regs[3]);
+        }
+    } else if constexpr (std::is_same_v<T, float>) {
+        ((float *) dst)[0] = regs[0];
+        ((float *) dst)[1] = regs[1];
+        if constexpr (ne == 4) {
+            ((float *) dst)[2] = regs[2];
+            ((float *) dst)[3] = regs[3];
+        }
+    }
+}
+
+// TurboQuant split-codebook K vec_dot for flash attention.
+// Each thread handles 4 consecutive channels, accumulates dot product with Q.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_turbo_split_0 * K_split = (const block_turbo_split_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
+    float sum = 0.0f;
+
+    constexpr int n_blocks = D / QK_TURBO_SPLIT;
+
+#pragma unroll
+    for (int ib = 0; ib < n_blocks; ib++) {
+        const float norm = __half2float(K_split[ib].norm);
+
+        uint32_t mask_words[4];
+        memcpy(mask_words, K_split[ib].outlier_mask, 16);
+
+        const int base = lane * 4;
+
+#pragma unroll
+        for (int l = 0; l < 4; l++) {
+            const int j    = base + l;
+            const int word = j / 32;
+            const int bit  = j % 32;
+            const bool is_outlier = (mask_words[word] >> bit) & 1;
+
+            float val;
+            if (is_outlier) {
+                int o_idx = 0;
+                for (int w = 0; w < word; w++) o_idx += __popc(mask_words[w]);
+                o_idx += __popc(mask_words[word] & ((1u << bit) - 1));
+                int bo = o_idx * 3;
+                uint16_t raw;
+                memcpy(&raw, &K_split[ib].qs_outlier[bo / 8], sizeof(uint16_t));
+                uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                val = TURBO_CENTROIDS_3BIT[idx] * norm;
+            } else {
+                int r_idx = j;
+                for (int w = 0; w < word; w++) r_idx -= __popc(mask_words[w]);
+                r_idx -= __popc(mask_words[word] & ((1u << bit) - 1));
+                uint8_t idx = (K_split[ib].qs_regular[r_idx / 4] >> ((r_idx % 4) * 2)) & 0x3;
+                val = TURBO_CENTROIDS_2BIT[idx] * norm;
+            }
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            // Q_v is half2 array: element j is at index ib*QK_TURBO_SPLIT + j, packed as half2
+            const int qidx = (ib * QK_TURBO_SPLIT + j) / 2;
+            const half2 q_h2 = ((const half2 *) Q_v)[qidx];
+            sum += val * ((j & 1) ? __half2float(q_h2.y) : __half2float(q_h2.x));
+#else
+            const int qidx = (ib * QK_TURBO_SPLIT + j) / 2;
+            const float2 q_f2 = ((const float2 *) Q_v)[qidx];
+            sum += val * ((j & 1) ? q_f2.y : q_f2.x);
+#endif
+        }
+    }
+
+    return sum;
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -902,6 +1028,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO_SPLIT_0) {
+        return vec_dot_fattn_vec_KQ_turbo_split_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -928,6 +1056,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo3_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
         return dequantize_V_turbo4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO_SPLIT_0) {
+        return dequantize_V_turbo_split_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

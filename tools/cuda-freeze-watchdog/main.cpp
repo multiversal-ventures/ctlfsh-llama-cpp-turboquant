@@ -30,13 +30,16 @@ static void on_shutdown(int sig) { (void)sig; g_shutdown = 1; }
 static void on_sigchld(int sig) {
     (void)sig;
     int status;
-    // Reap any child, but only shutdown if it's the llama-server child.
-    // cuda-checkpoint fork/exec children also trigger SIGCHLD.
-    pid_t pid = waitpid(-1, &status, WNOHANG);
-    if (pid == g_child_pid) {
-        fprintf(stderr, "[watchdog] child %d exited (status %d)\n",
-                g_child_pid, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-        g_shutdown = 1;
+    // Reap all finished children. Only shutdown if llama-server child dies.
+    // cuda-checkpoint and proxy fork children also trigger SIGCHLD.
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (pid == g_child_pid) {
+            fprintf(stderr, "[watchdog] server child %d exited (status %d)\n",
+                    g_child_pid, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            g_shutdown = 1;
+        }
+        // proxy children and cuda-checkpoint children are silently reaped
     }
 }
 
@@ -247,7 +250,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[watchdog] %s:%d -> %s:%d (child PID %d)\n",
             g_listen_addr, g_listen_port, g_backend_addr, g_backend_port, g_child_pid);
 
-    // Main loop
+    // Main loop — fork per connection for concurrent requests
     while (!g_shutdown) {
         struct pollfd pfd = { listen_fd, POLLIN, 0 };
         if (poll(&pfd, 1, 1000) <= 0) continue;
@@ -257,11 +260,10 @@ int main(int argc, char ** argv) {
         int client_fd = accept(listen_fd, (struct sockaddr *)&caddr, &clen);
         if (client_fd < 0) continue;
 
-        struct timespec t0;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-
-        // Thaw if frozen
+        // Thaw if frozen (only in main process, before forking)
         if (g_child_frozen) {
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
             int rc = cuda_ckpt("unlock", g_child_pid);
             if (rc != 0) {
                 fprintf(stderr, "[watchdog] thaw failed (rc=%d)\n", rc);
@@ -277,25 +279,44 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "[watchdog] thawed in %ldms\n", ms_since(&t0));
         }
 
-        // Connect to backend
-        int bfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (bfd < 0) { close(client_fd); continue; }
+        // Fork a proxy child to handle this connection
+        pid_t proxy_pid = fork();
+        if (proxy_pid < 0) {
+            perror("fork proxy");
+            close(client_fd);
+            continue;
+        }
+        if (proxy_pid == 0) {
+            // Proxy child: connect to backend, shuttle bytes, exit
+            close(listen_fd);
+            // Reset signals to default in proxy child
+            signal(SIGUSR1, SIG_DFL);
+            signal(SIGCHLD, SIG_DFL);
 
-        struct sockaddr_in baddr;
-        memset(&baddr, 0, sizeof(baddr));
-        baddr.sin_family = AF_INET;
-        baddr.sin_port   = htons(g_backend_port);
-        inet_pton(AF_INET, g_backend_addr, &baddr.sin_addr);
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        if (connect(bfd, (struct sockaddr *)&baddr, sizeof(baddr)) < 0) {
-            fprintf(stderr, "[watchdog] backend connect failed\n");
-            close(bfd); close(client_fd); continue;
+            int bfd = socket(AF_INET, SOCK_STREAM, 0);
+            if (bfd < 0) { close(client_fd); _exit(1); }
+
+            struct sockaddr_in baddr;
+            memset(&baddr, 0, sizeof(baddr));
+            baddr.sin_family = AF_INET;
+            baddr.sin_port   = htons(g_backend_port);
+            inet_pton(AF_INET, g_backend_addr, &baddr.sin_addr);
+
+            if (connect(bfd, (struct sockaddr *)&baddr, sizeof(baddr)) < 0) {
+                close(bfd); close(client_fd); _exit(1);
+            }
+
+            proxy_fds(client_fd, bfd);
+            fprintf(stderr, "[watchdog] request done (%ldms)\n", ms_since(&t0));
+            close(bfd);
+            close(client_fd);
+            _exit(0);
         }
 
-        // Proxy
-        proxy_fds(client_fd, bfd);
-        fprintf(stderr, "[watchdog] request done (%ldms)\n", ms_since(&t0));
-        close(bfd);
+        // Parent: close client fd (proxy child owns it now)
         close(client_fd);
     }
 

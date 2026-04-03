@@ -105,14 +105,16 @@ static __device__ __forceinline__ void turbo4_warp_dequant_block(
     // Step 3: Warp shuffle FWHT
     turbo4_warp_fwht(r0, r1, r2, r3, lane);
 
-    // Step 4: Normalize (1/sqrt(128)) and apply signs1
-    const float inv = 0.08838834764831845f;
-    r0 *= inv * TURBO_QJL_S1_FA[base + 0];
-    r1 *= inv * TURBO_QJL_S1_FA[base + 1];
-    r2 *= inv * TURBO_QJL_S1_FA[base + 2];
-    r3 *= inv * TURBO_QJL_S1_FA[base + 3];
+    // Step 4: Apply signs1 (no 1/sqrt(d) normalization — QJL expects raw S^T)
+    // Paper (Algorithm 2, line 11): x̃_qjl = sqrt(pi/2)/d · γ · S^T · qjl
+    // Our S^T = diag(s1) · H · diag(s2), unnormalized H has ||rows|| = sqrt(d),
+    // matching paper's iid N(0,1) matrix S whose rows also have ||·|| ≈ sqrt(d).
+    r0 *= TURBO_QJL_S1_FA[base + 0];
+    r1 *= TURBO_QJL_S1_FA[base + 1];
+    r2 *= TURBO_QJL_S1_FA[base + 2];
+    r3 *= TURBO_QJL_S1_FA[base + 3];
 
-    // Step 5: Scale QJL residual by sqrt(pi/2)/128 * rnorm
+    // Step 5: Scale QJL residual by sqrt(pi/2)/d * rnorm (paper Eq. Algorithm 2 line 11)
     const float rnorm = __half2float(__ldg(&blk->rnorm));
     const float qjl_scale = 1.2533141373155003f / 128.0f * rnorm;
     r0 *= qjl_scale;

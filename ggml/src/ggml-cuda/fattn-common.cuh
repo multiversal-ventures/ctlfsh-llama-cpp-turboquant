@@ -4,6 +4,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "turbo-qjl.cuh"
+#include "turbo-quant.cuh"
 
 #include <cstdint>
 
@@ -589,24 +590,62 @@ template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
 
-    const int64_t ib  = i0 / QK_TURBO3;
-    const int     iqs = i0 % QK_TURBO3;
-
-    const float norm = __half2float(__ldg(&x[ib].norm));
+    // lane = position within 128-element rotation group (0-31, 4 elements each)
+    // turbo3 blocks are 32 elements, 128 elements = 4 blocks per group
+    const int lane = (i0 % 128) / 4;
 
     static_assert(ne == 2 || ne == 4, "bad ne");
 
+    // Dequant 4 elements from the rotation group into registers
+    // Elements may span multiple turbo3 blocks (32 elements each)
+    float r0, r1, r2, r3;
+    {
+        const int group_start = (i0 / 128) * 128;
+        const int base = lane * 4;
 #pragma unroll
-    for (int l = 0; l < ne; ++l) {
-        const int j = iqs + l;
-        const uint8_t low2 = (__ldg(&x[ib].qs[j / 4]) >> ((j % 4) * 2)) & 0x3;
-        const uint8_t hi1  = (__ldg(&x[ib].signs[j / 8]) >> (j % 8)) & 0x1;
-        const uint8_t idx  = low2 | (hi1 << 2);
+        for (int l = 0; l < 4; ++l) {
+            const int elem = group_start + base + l;
+            const int ib   = elem / QK_TURBO3;
+            const int j    = elem % QK_TURBO3;
+            const float norm = __half2float(__ldg(&x[ib].norm));
+            const uint8_t low2 = (__ldg(&x[ib].qs[j / 4]) >> ((j % 4) * 2)) & 0x3;
+            const uint8_t hi1  = (__ldg(&x[ib].signs[j / 8]) >> (j % 8)) & 0x1;
+            const uint8_t idx  = low2 | (hi1 << 2);
+            float val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
+            if (l == 0) r0 = val; else if (l == 1) r1 = val;
+            else if (l == 2) r2 = val; else r3 = val;
+        }
+    }
 
-        if constexpr (std::is_same_v<T, half>) {
-            ((half *) dst)[l] = __float2half(TURBO_CENTROIDS_3BIT_FA[idx] * norm);
-        } else if constexpr (std::is_same_v<T, float>) {
-            ((float *) dst)[l] = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
+    // Inverse WHT: signs2 → FWHT → (1/√128) × signs1
+    const int base = lane * 4;
+    r0 *= TURBO_WHT_SIGNS2[base + 0];
+    r1 *= TURBO_WHT_SIGNS2[base + 1];
+    r2 *= TURBO_WHT_SIGNS2[base + 2];
+    r3 *= TURBO_WHT_SIGNS2[base + 3];
+
+    turbo4_warp_fwht(r0, r1, r2, r3, lane);
+
+    const float inv = TURBO_INV_SQRT_128;
+    r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
+    r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
+    r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
+    r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
+
+    // Write output
+    if constexpr (std::is_same_v<T, half>) {
+        ((half *) dst)[0] = __float2half(r0);
+        ((half *) dst)[1] = __float2half(r1);
+        if constexpr (ne == 4) {
+            ((half *) dst)[2] = __float2half(r2);
+            ((half *) dst)[3] = __float2half(r3);
+        }
+    } else if constexpr (std::is_same_v<T, float>) {
+        ((float *) dst)[0] = r0;
+        ((float *) dst)[1] = r1;
+        if constexpr (ne == 4) {
+            ((float *) dst)[2] = r2;
+            ((float *) dst)[3] = r3;
         }
     }
 }

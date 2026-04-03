@@ -617,20 +617,8 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __rest
         }
     }
 
-    // Inverse WHT: signs2 → FWHT → (1/√128) × signs1
-    const int base = lane * 4;
-    r0 *= TURBO_WHT_SIGNS2[base + 0];
-    r1 *= TURBO_WHT_SIGNS2[base + 1];
-    r2 *= TURBO_WHT_SIGNS2[base + 2];
-    r3 *= TURBO_WHT_SIGNS2[base + 3];
-
-    turbo4_warp_fwht(r0, r1, r2, r3, lane);
-
-    const float inv = TURBO_INV_SQRT_128;
-    r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
-    r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
-    r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
-    r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
+    // Graph-side WHT handles rotation (Q forward, output inverse).
+    // K/V stay in rotated space — no inverse WHT here.
 
     // Write output
     if constexpr (std::is_same_v<T, half>) {
@@ -650,7 +638,7 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __rest
     }
 }
 
-// TurboQuant 3-bit K vec_dot for flash attention — with dequant-side inverse WHT
+// TurboQuant 3-bit K vec_dot for flash attention — graph-side WHT handles rotation
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -686,24 +674,9 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
             }
         }
 
-        // Inverse WHT: signs2 → FWHT → 1/sqrt(128) * signs1
-        {
-            const int base = lane * 4;
-            r0 *= TURBO_WHT_SIGNS2[base + 0];
-            r1 *= TURBO_WHT_SIGNS2[base + 1];
-            r2 *= TURBO_WHT_SIGNS2[base + 2];
-            r3 *= TURBO_WHT_SIGNS2[base + 3];
+        // Graph-side WHT handles rotation. K stays in rotated space.
 
-            turbo4_warp_fwht(r0, r1, r2, r3, lane);
-
-            const float inv = TURBO_INV_SQRT_128;
-            r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
-            r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
-            r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
-            r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
-        }
-
-        // Dot with Q — redistribute to match Q layout (2 elements per thread)
+        // Dot with Q (also in rotated space) — redistribute to match Q layout
         // Sub-iter 0: elements 0..63
         {
             const float from_r0 = __shfl_sync(0xFFFFFFFF, r0, lane / 2);
@@ -761,22 +734,8 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     float r0, r1, r2, r3;
     turbo4_warp_dequant_block(&x[ib], r0, r1, r2, r3, lane);
 
-    // Inverse WHT: un-rotate from turbo space to original space
-    {
-        const int base = lane * 4;
-        r0 *= TURBO_WHT_SIGNS2[base + 0];
-        r1 *= TURBO_WHT_SIGNS2[base + 1];
-        r2 *= TURBO_WHT_SIGNS2[base + 2];
-        r3 *= TURBO_WHT_SIGNS2[base + 3];
-
-        turbo4_warp_fwht(r0, r1, r2, r3, lane);
-
-        const float inv = TURBO_INV_SQRT_128;
-        r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
-        r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
-        r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
-        r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
-    }
+    // Graph-side WHT handles rotation (Q forward, output inverse).
+    // V stays in rotated space — no inverse WHT here.
 
     static_assert(ne == 2 || ne == 4, "bad ne");
     if constexpr (std::is_same_v<T, half>) {
@@ -818,22 +777,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
         float r0, r1, r2, r3;
         turbo4_warp_dequant_block(&K_turbo4[ib], r0, r1, r2, r3, lane);
 
-        // Inverse WHT: un-rotate K from turbo space
-        {
-            const int base = lane * 4;
-            r0 *= TURBO_WHT_SIGNS2[base + 0];
-            r1 *= TURBO_WHT_SIGNS2[base + 1];
-            r2 *= TURBO_WHT_SIGNS2[base + 2];
-            r3 *= TURBO_WHT_SIGNS2[base + 3];
-
-            turbo4_warp_fwht(r0, r1, r2, r3, lane);
-
-            const float inv = TURBO_INV_SQRT_128;
-            r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
-            r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
-            r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
-            r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
-        }
+        // Graph-side WHT handles rotation. K stays in rotated space.
 
         // Redistribute: thread lane needs K[2*lane] and K[2*lane+1] for sub-iter 0,
         // and K[64+2*lane], K[64+2*lane+1] for sub-iter 1.

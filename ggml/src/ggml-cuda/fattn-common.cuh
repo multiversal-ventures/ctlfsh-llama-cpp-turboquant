@@ -718,6 +718,23 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     float r0, r1, r2, r3;
     turbo4_warp_dequant_block(&x[ib], r0, r1, r2, r3, lane);
 
+    // Inverse WHT: un-rotate from turbo space to original space
+    {
+        const int base = lane * 4;
+        r0 *= TURBO_WHT_SIGNS2[base + 0];
+        r1 *= TURBO_WHT_SIGNS2[base + 1];
+        r2 *= TURBO_WHT_SIGNS2[base + 2];
+        r3 *= TURBO_WHT_SIGNS2[base + 3];
+
+        turbo4_warp_fwht(r0, r1, r2, r3, lane);
+
+        const float inv = TURBO_INV_SQRT_128;
+        r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
+        r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
+        r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
+        r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
+    }
+
     static_assert(ne == 2 || ne == 4, "bad ne");
     if constexpr (std::is_same_v<T, half>) {
         ((half *) dst)[0] = __float2half(r0);

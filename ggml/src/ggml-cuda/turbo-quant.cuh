@@ -27,6 +27,17 @@ __constant__ static const float TURBO_MIDPOINTS_3BIT[7] = {
      0.043589f,  0.091775f,  0.154259f
 };
 
+// --- 2-bit Lloyd-Max centroids for N(0, 1/sqrt(128)) ---
+// Standard 2-bit centroids for N(0,1): +/-0.4528, +/-1.5104
+// Scaled by sigma = 1/sqrt(128) = 0.08839
+__constant__ static const float TURBO_CENTROIDS_2BIT[4] = {
+    -0.133494f, -0.040023f, 0.040023f, 0.133494f
+};
+
+__constant__ static const float TURBO_MIDPOINTS_2BIT[3] = {
+    -0.086759f, 0.0f, 0.086759f
+};
+
 // --- WHT rotation sign arrays (seed=42) ---
 // These MUST match Metal turbo-wht.h and CPU ops.cpp exactly.
 __constant__ static const float TURBO_WHT_SIGNS1[128] = {
@@ -135,6 +146,13 @@ static __device__ __forceinline__ uint8_t turbo_nearest_centroid_3bit(float val)
     else if (val < TURBO_MIDPOINTS_3BIT[5]) return 5;
     else if (val < TURBO_MIDPOINTS_3BIT[6]) return 6;
     else                                    return 7;
+}
+
+static __device__ __forceinline__ uint8_t turbo_nearest_centroid_2bit(float val) {
+    if      (val < TURBO_MIDPOINTS_2BIT[0]) return 0;
+    else if (val < TURBO_MIDPOINTS_2BIT[1]) return 1;
+    else if (val < TURBO_MIDPOINTS_2BIT[2]) return 2;
+    else                                    return 3;
 }
 
 // ============================================================================
@@ -251,6 +269,84 @@ static __device__ void quantize_f32_turbo4_0_block(
             dst->signs[i / 8] |= (1 << (i % 8));
         }
     }
+}
+
+// Quantize 128 floats → 1 block_turbo_split_0 (outlier-aware 32@3bit + 96@2bit)
+static __device__ void quantize_f32_turbo_split_0_block(
+        const float * __restrict__ src,
+        block_turbo_split_0 * __restrict__ dst) {
+    // Step 1: L2 norm
+    float norm_sq = 0.0f;
+    for (int j = 0; j < QK_TURBO_SPLIT; j++) {
+        norm_sq += src[j] * src[j];
+    }
+    float grp_norm = sqrtf(norm_sq);
+    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+    // Step 2: normalize + WHT rotate
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
+    turbo_rotate_forward(x);
+
+    // Step 3: find top 32 by magnitude (outlier selection)
+    // Partial selection sort: find 32 largest magnitudes
+    float magnitudes[128];
+    int indices[128];
+    for (int j = 0; j < 128; j++) {
+        magnitudes[j] = fabsf(x[j]);
+        indices[j] = j;
+    }
+    for (int i = 0; i < 32; i++) {
+        int max_idx = i;
+        for (int j = i + 1; j < 128; j++) {
+            if (magnitudes[j] > magnitudes[max_idx]) max_idx = j;
+        }
+        float tmp_m = magnitudes[i]; magnitudes[i] = magnitudes[max_idx]; magnitudes[max_idx] = tmp_m;
+        int tmp_i = indices[i]; indices[i] = indices[max_idx]; indices[max_idx] = tmp_i;
+    }
+
+    // Build 128-bit outlier mask from top-32 indices
+    memset(dst->outlier_mask, 0, 16);
+    for (int i = 0; i < 32; i++) {
+        int j = indices[i];
+        dst->outlier_mask[j / 8] |= (1u << (j % 8));
+    }
+
+    // Step 4: quantize with dual codebook
+    // Outlier channels (top 32 by magnitude) → 3-bit (8 centroids, more precision)
+    // Regular channels (bottom 96) → 2-bit (4 centroids)
+    float recon_norm_sq = 0.0f;
+    int o_idx = 0, r_idx = 0;
+    memset(dst->qs_outlier, 0, 12);
+    memset(dst->qs_regular, 0, 24);
+
+    for (int j = 0; j < 128; j++) {
+        bool is_outlier = (dst->outlier_mask[j / 8] >> (j % 8)) & 1;
+        if (is_outlier) {
+            uint8_t idx = turbo_nearest_centroid_3bit(x[j]);
+            // Pack 3-bit into qs_outlier (bit-packed spanning byte boundaries)
+            int bo = o_idx * 3;
+            int byte_idx = bo / 8;
+            int bit_pos = bo % 8;
+            dst->qs_outlier[byte_idx] |= (uint8_t)((idx & 0x7) << bit_pos);
+            if (bit_pos > 5 && byte_idx + 1 < 12) {
+                dst->qs_outlier[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
+            }
+            recon_norm_sq += TURBO_CENTROIDS_3BIT[idx] * TURBO_CENTROIDS_3BIT[idx];
+            o_idx++;
+        } else {
+            uint8_t idx = turbo_nearest_centroid_2bit(x[j]);
+            // Pack 2-bit into qs_regular (4 per byte)
+            dst->qs_regular[r_idx / 4] |= (idx & 0x3) << ((r_idx % 4) * 2);
+            recon_norm_sq += TURBO_CENTROIDS_2BIT[idx] * TURBO_CENTROIDS_2BIT[idx];
+            r_idx++;
+        }
+    }
+
+    // Step 5: norm correction — dequant gets exact original L2 norm for free
+    float recon_norm = sqrtf(recon_norm_sq);
+    float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+    dst->norm = __float2half(corrected_norm);
 }
 
 // ============================================================================

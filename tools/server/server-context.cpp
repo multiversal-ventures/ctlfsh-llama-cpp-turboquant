@@ -5,6 +5,8 @@
 #include "server-queue.h"
 #include "cuda-checkpoint.h"
 
+#include <signal.h>
+
 #include "common.h"
 #include "llama.h"
 #include "log.h"

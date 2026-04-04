@@ -819,6 +819,41 @@ static void dequantize_row_turbo_split_0_cuda(const void * vx, dst_t * y, const 
     dequantize_block_turbo_split_0<<<grid_size, block_size, 0, stream>>>(vx, y, k);
 }
 
+// turbo_split2: fixed outlier layout, 32@3bit + 96@2bit, QK=128
+template<typename dst_t>
+static __global__ void dequantize_block_turbo_split2_0(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= k) return;
+    const int64_t ib = i / QK_TURBO_SPLIT2;
+    const int     pos = i % QK_TURBO_SPLIT2;
+    const block_turbo_split2_0 * x = (const block_turbo_split2_0 *) vx;
+    const float norm = __half2float(x[ib].norm);
+
+    uint8_t idx;
+    float val;
+    if (pos < 32) {
+        // 3-bit unpack from qs_hi
+        const int bo = pos * 3;
+        uint16_t raw;
+        memcpy(&raw, &x[ib].qs_hi[bo / 8], sizeof(uint16_t));
+        idx = (raw >> (bo % 8)) & 0x7;
+        val = turbo_centroids_3bit_convert[idx] * norm;
+    } else {
+        // 2-bit unpack from qs_lo
+        const int rpos = pos - 32;
+        idx = (x[ib].qs_lo[rpos / 4] >> ((rpos % 4) * 2)) & 0x3;
+        val = turbo_centroids_2bit_convert[idx] * norm;
+    }
+    y[i] = ggml_cuda_cast<dst_t>(val);
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo_split2_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int block_size = 256;
+    const int grid_size = (k + block_size - 1) / block_size;
+    dequantize_block_turbo_split2_0<<<grid_size, block_size, 0, stream>>>(vx, y, k);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -887,6 +922,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_turbo4_0_cuda;
         case GGML_TYPE_TURBO_SPLIT_0:
             return dequantize_row_turbo_split_0_cuda;
+        case GGML_TYPE_TURBO_SPLIT2_0:
+            return dequantize_row_turbo_split2_0_cuda;
         default:
             return nullptr;
     }
@@ -946,6 +983,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_turbo4_0_cuda;
         case GGML_TYPE_TURBO_SPLIT_0:
             return dequantize_row_turbo_split_0_cuda;
+        case GGML_TYPE_TURBO_SPLIT2_0:
+            return dequantize_row_turbo_split2_0_cuda;
         default:
             return nullptr;
     }

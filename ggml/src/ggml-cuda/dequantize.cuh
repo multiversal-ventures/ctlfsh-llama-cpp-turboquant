@@ -155,6 +155,9 @@ static const __device__ float TURBO_CENTROIDS_2BIT_DEQUANT[4] = {
 #define QR_TURBO_SPLIT 1
 #define QI_TURBO_SPLIT (QK_TURBO_SPLIT / (2 * QR_TURBO_SPLIT))
 
+#define QR_TURBO_SPLIT2 1
+#define QI_TURBO_SPLIT2 (QK_TURBO_SPLIT2 / (4 * QR_TURBO_SPLIT2))
+
 static __device__ __forceinline__ void dequantize_turbo_split_0(const void * vx, const int64_t ib, const int iqs, float2 & v) {
     const block_turbo_split_0 * x = (const block_turbo_split_0 *) vx;
     const float norm = __half2float(x[ib].norm);

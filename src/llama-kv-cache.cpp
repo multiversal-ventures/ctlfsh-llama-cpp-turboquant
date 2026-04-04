@@ -210,7 +210,7 @@ llama_kv_cache::llama_kv_cache(
                 }
                 return mode;
             }();
-            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO_SPLIT_0);
+            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO_SPLIT_0 || type_k == GGML_TYPE_TURBO_SPLIT2_0);
             const uint32_t n_layer = hparams.n_layer;
             if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
                 if (il < 4 || il >= n_layer - 4) {
@@ -244,7 +244,7 @@ llama_kv_cache::llama_kv_cache(
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
-            (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO_SPLIT_0)) {
+            (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO_SPLIT_0 || type_k == GGML_TYPE_TURBO_SPLIT2_0)) {
             turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
             turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);

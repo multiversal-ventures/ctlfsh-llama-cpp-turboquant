@@ -757,24 +757,9 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     const int64_t ib  = i0 / QK_TURBO4;
     const int     lane = (i0 % QK_TURBO4) / 4;
 
-    // DIAGNOSTIC: bypass turbo4_warp_dequant_block, do simple centroid read like turbo3
-    // to isolate whether the bug is in the warp dequant or the block format
+    // Warp-cooperative QJL reconstruction — 4 registers, no local memory
     float r0, r1, r2, r3;
-    {
-        const float norm = __half2float(__ldg(&x[ib].norm));
-        const int base = lane * 4;
-#pragma unroll
-        for (int l = 0; l < 4; ++l) {
-            const int pos = base + l;
-            const int bo = pos * 3;
-            uint16_t raw;
-            memcpy(&raw, &x[ib].qs[bo / 8], sizeof(uint16_t));
-            const uint8_t idx = (raw >> (bo % 8)) & 0x7;
-            float val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
-            if (l == 0) r0 = val; else if (l == 1) r1 = val;
-            else if (l == 2) r2 = val; else r3 = val;
-        }
-    }
+    turbo4_warp_dequant_block(&x[ib], r0, r1, r2, r3, lane);
 
     // Inverse WHT: un-rotate from turbo space to original space
     {
@@ -829,23 +814,9 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
 
 #pragma unroll
     for (int ib = 0; ib < n_blocks; ib++) {
-        // DIAGNOSTIC: bypass warp dequant, do simple centroid read like turbo3
+        // Warp-cooperative QJL reconstruction — 4 registers per thread
         float r0, r1, r2, r3;
-        {
-            const float norm = __half2float(__ldg(&K_turbo4[ib].norm));
-            const int base = lane * 4;
-#pragma unroll
-            for (int l = 0; l < 4; ++l) {
-                const int pos = base + l;
-                const int bo = pos * 3;
-                uint16_t raw;
-                memcpy(&raw, &K_turbo4[ib].qs[bo / 8], sizeof(uint16_t));
-                const uint8_t idx = (raw >> (bo % 8)) & 0x7;
-                float val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
-                if (l == 0) r0 = val; else if (l == 1) r1 = val;
-                else if (l == 2) r2 = val; else r3 = val;
-            }
-        }
+        turbo4_warp_dequant_block(&K_turbo4[ib], r0, r1, r2, r3, lane);
 
         // Inverse WHT: un-rotate K from turbo space
         {

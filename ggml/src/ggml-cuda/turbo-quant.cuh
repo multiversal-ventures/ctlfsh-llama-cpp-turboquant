@@ -108,23 +108,21 @@ static __device__ __forceinline__ void turbo_fwht_128(float * x) {
     }
 }
 
-// Forward rotation: signs1 → FWHT → (1/√d) → signs2
-// Normalized: ||R(x)|| = ||x|| (orthogonal). Each coordinate of R(x̂) ~ N(0,1/d),
-// matching the Lloyd-Max centroid distribution. Paper: Algorithm 1, line 5.
+// Forward rotation: signs1 → FWHT(includes 1/√d) → signs2
+// turbo_fwht_128 already applies 1/√d normalization (line 107).
+// Result: ||R(x)|| = ||x|| (orthogonal). Each coordinate ~ N(0,1/d).
 static __device__ __forceinline__ void turbo_rotate_forward(float * x) {
     for (int i = 0; i < 128; i++) x[i] *= TURBO_WHT_SIGNS1[i];
     turbo_fwht_128(x);
-    const float inv_sqrt_d = 0.08838834764831845f; // 1/sqrt(128)
-    for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_d * TURBO_WHT_SIGNS2[i];
+    for (int i = 0; i < 128; i++) x[i] *= TURBO_WHT_SIGNS2[i];
 }
 
-// Inverse rotation: signs2 → FWHT → (1/√d) → signs1
-// Normalized inverse: R^{-1}(R(x)) = x exactly.
+// Inverse rotation: signs2 → FWHT(includes 1/√d) → signs1
+// Round-trip: R^{-1}(R(x)) = x (since FWHT applies 1/√d, two passes give 1/d × d = identity).
 static __device__ __forceinline__ void turbo_rotate_inverse(float * x) {
     for (int i = 0; i < 128; i++) x[i] *= TURBO_WHT_SIGNS2[i];
     turbo_fwht_128(x);
-    const float inv_sqrt_d = 0.08838834764831845f; // 1/sqrt(128)
-    for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_d * TURBO_WHT_SIGNS1[i];
+    for (int i = 0; i < 128; i++) x[i] *= TURBO_WHT_SIGNS1[i];
 }
 
 // QJL forward rotation (seed=1042)

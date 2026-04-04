@@ -427,3 +427,51 @@ size_t quantize_turbo_split_0(const float * GGML_RESTRICT src, void * GGML_RESTR
     }
     return nrows * row_size;
 }
+
+// --- TurboSplit2: fixed-layout 32ch@3bit + 96ch@2bit, 40-byte block ---
+
+void quantize_row_turbo_split2_0_ref(const float * GGML_RESTRICT x, block_turbo_split2_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO_SPLIT2 == 0);
+    const int nb = k / QK_TURBO_SPLIT2;
+    for (int i = 0; i < nb; i++) {
+        float norm = 0.0f;
+        for (int j = 0; j < QK_TURBO_SPLIT2; j++) norm += x[i*QK_TURBO_SPLIT2 + j] * x[i*QK_TURBO_SPLIT2 + j];
+        y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
+        memset(y[i].qs_hi, 0, 12);
+        memset(y[i].qs_lo, 0, 24);
+        memset(y[i].padding, 0, 2);
+    }
+}
+
+void dequantize_row_turbo_split2_0(const block_turbo_split2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO_SPLIT2 == 0);
+    const int nb = k / QK_TURBO_SPLIT2;
+    for (int block = 0; block < nb; block++) {
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        // First 32 channels: 3-bit indices from qs_hi
+        for (int j = 0; j < 32; j++) {
+            int bo = j * 3;
+            uint16_t raw;
+            memcpy(&raw, &x[block].qs_hi[bo / 8], sizeof(uint16_t));
+            uint8_t idx = (raw >> (bo % 8)) & 0x7;
+            y[block * QK_TURBO_SPLIT2 + j] = CENTROIDS_3BIT[idx] * norm;
+        }
+        // Remaining 96 channels: 2-bit indices from qs_lo (4 per byte)
+        for (int j = 0; j < 96; j++) {
+            uint8_t idx = (x[block].qs_lo[j / 4] >> ((j % 4) * 2)) & 0x3;
+            y[block * QK_TURBO_SPLIT2 + 32 + j] = CENTROIDS_2BIT[idx] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo_split2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                               int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO_SPLIT2 == 0);
+    size_t row_size = (n_per_row / QK_TURBO_SPLIT2) * sizeof(block_turbo_split2_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo_split2_0_ref(src + row * n_per_row,
+            (block_turbo_split2_0 *)((char *)dst + row * row_size), n_per_row);
+    }
+    return nrows * row_size;
+}

@@ -308,6 +308,21 @@ typedef struct {
 static_assert(sizeof(block_turbo_split_0) == sizeof(ggml_half) + 16 + 12 + 36 + 2,
               "wrong turbo_split_0 block size/padding");
 
+// TurboQuant split2: fixed outlier layout 32ch@3bit + 96ch@2bit, no mask needed
+// Per block: norm(fp16) + 3-bit hi indices (12 bytes) + 2-bit lo indices (24 bytes) + 2 padding
+// = 40 bytes per 128 values = 2.5 bits/value → 6.4× compression vs fp16
+#define QK_TURBO_SPLIT2 128
+
+#pragma pack(push, 1)
+typedef struct {
+    ggml_half  norm;         //  2 bytes: corrected L2 norm
+    uint8_t    qs_hi[12];   // 12 bytes: 32 x 3-bit indices, bit-packed
+    uint8_t    qs_lo[24];   // 24 bytes: 96 x 2-bit indices, 4 per byte
+    uint8_t    padding[2];  //  2 bytes: align to 40 (4-byte aligned)
+} block_turbo_split2_0;     // 40 bytes total
+#pragma pack(pop)
+static_assert(sizeof(block_turbo_split2_0) == 40, "wrong turbo_split2_0 block size");
+
 //
 // Super-block quantization structures
 //

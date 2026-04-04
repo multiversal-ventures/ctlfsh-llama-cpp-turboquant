@@ -586,6 +586,10 @@ static const __device__ float TURBO_CENTROIDS_3BIT_FA[8] = {
      0.021460f,  0.065717f,  0.117832f,  0.190685f
 };
 
+static const __device__ float TURBO_CENTROIDS_2BIT_DEQUANT[4] = {
+    -0.133494f, -0.040023f, 0.040023f, 0.133494f
+};
+
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
@@ -1016,6 +1020,175 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split_0(
     return sum;
 }
 
+// TurboQuant split2 V dequantize — 32@3bit + 96@2bit, lane-based split
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo_split2_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo_split2_0 * x = (const block_turbo_split2_0 *) vx;
+    const int64_t ib = i0 / QK_TURBO_SPLIT2;
+    const int lane = (i0 % QK_TURBO_SPLIT2) / 4;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    const float norm = __half2float(__ldg(&x[ib].norm));
+    float r0, r1, r2, r3;
+    {
+        const int base = lane * 4;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int pos = base + l;
+            float val;
+            if (pos < 32) {
+                // 3-bit from qs_hi: contiguous bit-pack
+                const int bo = pos * 3;
+                uint16_t raw;
+                memcpy(&raw, &x[ib].qs_hi[bo / 8], sizeof(uint16_t));
+                const uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
+            } else {
+                // 2-bit from qs_lo: 4 per byte
+                const int rpos = pos - 32;
+                const uint8_t byte_val = __ldg(&x[ib].qs_lo[rpos / 4]);
+                const uint8_t idx = (byte_val >> ((rpos % 4) * 2)) & 0x3;
+                val = TURBO_CENTROIDS_2BIT_DEQUANT[idx] * norm;
+            }
+            if (l == 0) r0 = val; else if (l == 1) r1 = val;
+            else if (l == 2) r2 = val; else r3 = val;
+        }
+    }
+
+    // Inverse WHT: signs2 → FWHT → (1/√128) × signs1
+    const int base = lane * 4;
+    r0 *= TURBO_WHT_SIGNS2[base + 0];
+    r1 *= TURBO_WHT_SIGNS2[base + 1];
+    r2 *= TURBO_WHT_SIGNS2[base + 2];
+    r3 *= TURBO_WHT_SIGNS2[base + 3];
+
+    turbo4_warp_fwht(r0, r1, r2, r3, lane);
+
+    const float inv = TURBO_INV_SQRT_128;
+    r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
+    r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
+    r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
+    r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
+
+    // Write output
+    if constexpr (std::is_same_v<T, half>) {
+        ((half *) dst)[0] = __float2half(r0);
+        ((half *) dst)[1] = __float2half(r1);
+        if constexpr (ne == 4) {
+            ((half *) dst)[2] = __float2half(r2);
+            ((half *) dst)[3] = __float2half(r3);
+        }
+    } else if constexpr (std::is_same_v<T, float>) {
+        ((float *) dst)[0] = r0;
+        ((float *) dst)[1] = r1;
+        if constexpr (ne == 4) {
+            ((float *) dst)[2] = r2;
+            ((float *) dst)[3] = r3;
+        }
+    }
+}
+
+// TurboQuant split2 K vec_dot for flash attention — with dequant-side inverse WHT
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split2_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_turbo_split2_0 * K_split2 = (const block_turbo_split2_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
+    float sum = 0.0f;
+    constexpr int n_blocks = D / QK_TURBO_SPLIT2;
+
+#pragma unroll
+    for (int ib = 0; ib < n_blocks; ib++) {
+        const float norm = __half2float(__ldg(&K_split2[ib].norm));
+        float r0, r1, r2, r3;
+        {
+            const int base = lane * 4;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int pos = base + l;
+                float val;
+                if (pos < 32) {
+                    const int bo = pos * 3;
+                    uint16_t raw;
+                    memcpy(&raw, &K_split2[ib].qs_hi[bo / 8], sizeof(uint16_t));
+                    const uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                    val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
+                } else {
+                    const int rpos = pos - 32;
+                    const uint8_t byte_val = __ldg(&K_split2[ib].qs_lo[rpos / 4]);
+                    const uint8_t idx = (byte_val >> ((rpos % 4) * 2)) & 0x3;
+                    val = TURBO_CENTROIDS_2BIT_DEQUANT[idx] * norm;
+                }
+                if (l == 0) r0 = val; else if (l == 1) r1 = val;
+                else if (l == 2) r2 = val; else r3 = val;
+            }
+        }
+
+        // Inverse WHT: signs2 → FWHT → 1/sqrt(128) * signs1
+        {
+            const int base = lane * 4;
+            r0 *= TURBO_WHT_SIGNS2[base + 0];
+            r1 *= TURBO_WHT_SIGNS2[base + 1];
+            r2 *= TURBO_WHT_SIGNS2[base + 2];
+            r3 *= TURBO_WHT_SIGNS2[base + 3];
+
+            turbo4_warp_fwht(r0, r1, r2, r3, lane);
+
+            const float inv = TURBO_INV_SQRT_128;
+            r0 *= inv * TURBO_WHT_SIGNS1[base + 0];
+            r1 *= inv * TURBO_WHT_SIGNS1[base + 1];
+            r2 *= inv * TURBO_WHT_SIGNS1[base + 2];
+            r3 *= inv * TURBO_WHT_SIGNS1[base + 3];
+        }
+
+        // Dot with Q — redistribute to match Q layout (2 elements per thread)
+        // Sub-iter 0: elements 0..63
+        {
+            const float from_r0 = __shfl_sync(0xFFFFFFFF, r0, lane / 2);
+            const float from_r2 = __shfl_sync(0xFFFFFFFF, r2, lane / 2);
+            const float val0 = (lane & 1) ? from_r2 : from_r0;
+
+            const float from_r1 = __shfl_sync(0xFFFFFFFF, r1, lane / 2);
+            const float from_r3 = __shfl_sync(0xFFFFFFFF, r3, lane / 2);
+            const float val1 = (lane & 1) ? from_r3 : from_r1;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 q_h2 = ((const half2 *) Q_v)[ib * 2 + 0];
+            sum += val0 * __half2float(q_h2.x) + val1 * __half2float(q_h2.y);
+#else
+            const float2 q_f2 = ((const float2 *) Q_v)[ib * 2 + 0];
+            sum += val0 * q_f2.x + val1 * q_f2.y;
+#endif
+        }
+
+        // Sub-iter 1: elements 64..127
+        {
+            const float from_r0 = __shfl_sync(0xFFFFFFFF, r0, 16 + lane / 2);
+            const float from_r2 = __shfl_sync(0xFFFFFFFF, r2, 16 + lane / 2);
+            const float val0 = (lane & 1) ? from_r2 : from_r0;
+
+            const float from_r1 = __shfl_sync(0xFFFFFFFF, r1, 16 + lane / 2);
+            const float from_r3 = __shfl_sync(0xFFFFFFFF, r3, 16 + lane / 2);
+            const float val1 = (lane & 1) ? from_r3 : from_r1;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 q_h2 = ((const half2 *) Q_v)[ib * 2 + 1];
+            sum += val0 * __half2float(q_h2.x) + val1 * __half2float(q_h2.y);
+#else
+            const float2 q_f2 = ((const float2 *) Q_v)[ib * 2 + 1];
+            sum += val0 * q_f2.x + val1 * q_f2.y;
+#endif
+        }
+    }
+
+    return sum;
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -1038,6 +1211,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO_SPLIT_0) {
         return vec_dot_fattn_vec_KQ_turbo_split_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO_SPLIT2_0) {
+        return vec_dot_fattn_vec_KQ_turbo_split2_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -1066,6 +1241,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO_SPLIT_0) {
         return dequantize_V_turbo_split_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO_SPLIT2_0) {
+        return dequantize_V_turbo_split2_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

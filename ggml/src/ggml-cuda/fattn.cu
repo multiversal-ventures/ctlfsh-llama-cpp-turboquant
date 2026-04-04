@@ -285,6 +285,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO_SPLIT_0, GGML_TYPE_TURBO_SPLIT_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO_SPLIT2_0, GGML_TYPE_TURBO_SPLIT2_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -389,6 +390,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_TURBO_SPLIT_0:
+        case GGML_TYPE_TURBO_SPLIT2_0:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;

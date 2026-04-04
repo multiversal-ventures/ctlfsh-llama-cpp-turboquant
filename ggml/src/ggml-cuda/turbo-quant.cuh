@@ -353,6 +353,59 @@ static __device__ void quantize_f32_turbo_split_0_block(
     dst->norm = __float2half(corrected_norm);
 }
 
+// Quantize 128 floats → 1 block_turbo_split2_0 (2.5-bit split: 32@3bit + 96@2bit)
+static __device__ void quantize_f32_turbo_split2_0_block(
+        const float * __restrict__ src,
+        block_turbo_split2_0 * __restrict__ dst) {
+    // Step 1: L2 norm + normalize
+    float norm_sq = 0.0f;
+    for (int j = 0; j < QK_TURBO_SPLIT2; j++) norm_sq += src[j] * src[j];
+    float grp_norm = sqrtf(norm_sq);
+    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+    // Step 2: Normalize + WHT rotate
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
+    turbo_rotate_forward(x);
+
+    // Step 3: Clear output arrays
+    for (int j = 0; j < 12; j++) dst->qs_hi[j] = 0;
+    for (int j = 0; j < 24; j++) dst->qs_lo[j] = 0;
+    dst->padding[0] = 0;
+    dst->padding[1] = 0;
+
+    // Step 4: Quantize channels 0-31 with 3-bit codebook → qs_hi[12]
+    float recon_norm_sq = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        uint8_t idx = turbo_nearest_centroid_3bit(x[j]);
+        recon_norm_sq += TURBO_CENTROIDS_3BIT[idx] * TURBO_CENTROIDS_3BIT[idx];
+
+        // 3-bit contiguous bit-pack
+        int bit_offset = j * 3;
+        int byte_idx = bit_offset / 8;
+        int bit_pos = bit_offset % 8;
+        dst->qs_hi[byte_idx] |= (uint8_t)((idx & 0x7) << bit_pos);
+        if (bit_pos > 5 && byte_idx + 1 < 12) {
+            dst->qs_hi[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
+        }
+    }
+
+    // Step 5: Quantize channels 32-127 with 2-bit codebook → qs_lo[24]
+    for (int j = 32; j < 128; j++) {
+        uint8_t idx = turbo_nearest_centroid_2bit(x[j]);
+        recon_norm_sq += TURBO_CENTROIDS_2BIT[idx] * TURBO_CENTROIDS_2BIT[idx];
+
+        // 2-bit pack: 4 values per byte
+        int rpos = j - 32;  // 0-95
+        dst->qs_lo[rpos / 4] |= (uint8_t)(idx << ((rpos % 4) * 2));
+    }
+
+    // Step 6: Norm correction
+    float recon_norm = sqrtf(recon_norm_sq);
+    float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+    dst->norm = __float2half(corrected_norm);
+}
+
 // ============================================================================
 // Op dispatch declarations
 // ============================================================================

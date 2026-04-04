@@ -8,6 +8,8 @@ template <typename idx_t>
 void ggml_cuda_set_rows_turbo4(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 template <typename idx_t>
 void ggml_cuda_set_rows_turbo_split(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+template <typename idx_t>
+void ggml_cuda_set_rows_turbo_split2(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -325,6 +327,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         return;
     } else if (dst->type == GGML_TYPE_TURBO_SPLIT_0) {
         ggml_cuda_set_rows_turbo_split<idx_t>(ctx, src0, src1, dst);
+        return;
+    } else if (dst->type == GGML_TYPE_TURBO_SPLIT2_0) {
+        ggml_cuda_set_rows_turbo_split2<idx_t>(ctx, src0, src1, dst);
         return;
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));

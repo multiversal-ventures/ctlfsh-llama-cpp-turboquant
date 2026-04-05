@@ -357,7 +357,7 @@ static __device__ void quantize_f32_turbo_split_0_block(
 // Generated from 2000-sample empirical profiling on T4 (2026-04-04)
 // PERM[j] maps original channel j → permuted position (used in quantize)
 // PERM_INV[p] maps permuted position p → original channel (used in dequant to find where to read)
-__constant__ static const int TURBO_SPLIT2_PERM[128] = {
+static __device__ const int TURBO_SPLIT2_PERM[128] = {
     111,  70, 104,  71,  67, 105, 108,  64, 125, 106, 110,  66,  96, 107, 109,  99,
     101, 123,  97, 124, 103,  68,  69,  74,  75,  65, 126,  73, 122, 102,  78, 120,
      82,  80, 112, 100,  84, 116,  86,  77, 115,  85,  98,  72,  83,  79,  91, 127,
@@ -368,7 +368,7 @@ __constant__ static const int TURBO_SPLIT2_PERM[128] = {
      11,  19,  16,  46,  54,  17,   3,  28,  12,  30,  20,  24,  25,  21,  27,  26
 };
 
-__constant__ static const int TURBO_SPLIT2_PERM_INV[128] = {
+static __device__ const int TURBO_SPLIT2_PERM_INV[128] = {
      84,  99, 109, 118,  98,  72,  96, 100, 110,  88, 103, 112, 120, 108,  92, 106,
     114, 117, 104, 113, 122, 125, 111, 107, 123, 124, 127, 126, 119,  94, 121,  93,
      83,  71,  91,  65,  64,  76,  75,  78,  60,  67,  85,  89,  87,  82, 115,  63,

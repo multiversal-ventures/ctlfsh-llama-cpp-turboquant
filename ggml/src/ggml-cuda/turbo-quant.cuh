@@ -355,29 +355,38 @@ static __device__ void quantize_f32_turbo_split_0_block(
 
 // Gemma 3 4B profiled channel permutation: top 32 variance channels → positions 0-31
 // Generated from 2000-sample empirical profiling on T4 (2026-04-04)
-// PERM[j] maps original channel j → permuted position (used in quantize)
-// PERM_INV[p] maps permuted position p → original channel (used in dequant to find where to read)
-static __device__ const int TURBO_SPLIT2_PERM[128] = {
-    111,  70, 104,  71,  67, 105, 108,  64, 125, 106, 110,  66,  96, 107, 109,  99,
-    101, 123,  97, 124, 103,  68,  69,  74,  75,  65, 126,  73, 122, 102,  78, 120,
-     82,  80, 112, 100,  84, 116,  86,  77, 115,  85,  98,  72,  83,  79,  91, 127,
-     93, 113, 117, 121,  81,  88,  76, 114,  87, 119,  89,  95,  40,  90,  92,  47,
-     36,  35,  94,  41,  50, 118,  62,  33,   5,  48,  56,  38,  37,  49,  39,  58,
-     51,  59,  45,  32,   0,  42,  61,  44,   9,  43,  60,  34,  14,  31,  29,  53,
-      6,  52,   4,   1,   7,  63,  55,  10,  18,  57,  15,  23,  13,   2,   8,  22,
-     11,  19,  16,  46,  54,  17,   3,  28,  12,  30,  20,  24,  25,  21,  27,  26
-};
+// PERM[rank] = original_channel (rank 0 = highest variance)
+// PERM_INV[original_channel] = rank/position in block
+// Using inline function to avoid __constant__/__device__ cross-CU issues
+static __device__ __forceinline__ int turbo_split2_perm(int rank) {
+    // Lookup: rank → original channel index
+    constexpr int T[128] = {
+        111,  70, 104,  71,  67, 105, 108,  64, 125, 106, 110,  66,  96, 107, 109,  99,
+        101, 123,  97, 124, 103,  68,  69,  74,  75,  65, 126,  73, 122, 102,  78, 120,
+         82,  80, 112, 100,  84, 116,  86,  77, 115,  85,  98,  72,  83,  79,  91, 127,
+         93, 113, 117, 121,  81,  88,  76, 114,  87, 119,  89,  95,  40,  90,  92,  47,
+         36,  35,  94,  41,  50, 118,  62,  33,   5,  48,  56,  38,  37,  49,  39,  58,
+         51,  59,  45,  32,   0,  42,  61,  44,   9,  43,  60,  34,  14,  31,  29,  53,
+          6,  52,   4,   1,   7,  63,  55,  10,  18,  57,  15,  23,  13,   2,   8,  22,
+         11,  19,  16,  46,  54,  17,   3,  28,  12,  30,  20,  24,  25,  21,  27,  26
+    };
+    return T[rank];
+}
 
-static __device__ const int TURBO_SPLIT2_PERM_INV[128] = {
-     84,  99, 109, 118,  98,  72,  96, 100, 110,  88, 103, 112, 120, 108,  92, 106,
-    114, 117, 104, 113, 122, 125, 111, 107, 123, 124, 127, 126, 119,  94, 121,  93,
-     83,  71,  91,  65,  64,  76,  75,  78,  60,  67,  85,  89,  87,  82, 115,  63,
-     73,  77,  68,  80,  97,  95, 116, 102,  74, 105,  79,  81,  90,  86,  70, 101,
-      7,  25,  11,   4,  21,  22,   1,   3,  43,  27,  23,  24,  54,  39,  30,  45,
-     33,  52,  32,  44,  36,  41,  38,  56,  53,  58,  61,  46,  62,  48,  66,  59,
-     12,  18,  42,  15,  35,  16,  29,  20,   2,   5,   9,  13,   6,  14,  10,   0,
-     34,  49,  55,  40,  37,  50,  69,  57,  31,  51,  28,  17,  19,   8,  26,  47
-};
+static __device__ __forceinline__ int turbo_split2_perm_inv(int orig_ch) {
+    // Lookup: original channel → rank/position in block
+    constexpr int T[128] = {
+         84,  99, 109, 118,  98,  72,  96, 100, 110,  88, 103, 112, 120, 108,  92, 106,
+        114, 117, 104, 113, 122, 125, 111, 107, 123, 124, 127, 126, 119,  94, 121,  93,
+         83,  71,  91,  65,  64,  76,  75,  78,  60,  67,  85,  89,  87,  82, 115,  63,
+         73,  77,  68,  80,  97,  95, 116, 102,  74, 105,  79,  81,  90,  86,  70, 101,
+          7,  25,  11,   4,  21,  22,   1,   3,  43,  27,  23,  24,  54,  39,  30,  45,
+         33,  52,  32,  44,  36,  41,  38,  56,  53,  58,  61,  46,  62,  48,  66,  59,
+         12,  18,  42,  15,  35,  16,  29,  20,   2,   5,   9,  13,   6,  14,  10,   0,
+         34,  49,  55,  40,  37,  50,  69,  57,  31,  51,  28,  17,  19,   8,  26,  47
+    };
+    return T[orig_ch];
+}
 
 // Profiling: accumulate per-channel variance after WHT rotation
 #ifndef TURBO_SPLIT2_PROFILE
@@ -432,7 +441,7 @@ static __device__ void quantize_f32_turbo_split2_0_block(
     // PERM maps: descending-variance-rank → original channel index
     // So permuted[p] = x[PERM[p]]: position p gets the value from original channel PERM[p]
     float xp[128];
-    for (int j = 0; j < 128; j++) xp[j] = x[TURBO_SPLIT2_PERM[j]];
+    for (int j = 0; j < 128; j++) xp[j] = x[turbo_split2_perm(j)];
 
     // Step 5: Quantize permuted channels 0-31 (outliers) with 3-bit → qs_hi[12]
     float recon_norm_sq = 0.0f;

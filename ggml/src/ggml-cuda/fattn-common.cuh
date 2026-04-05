@@ -1039,7 +1039,7 @@ static __device__ __forceinline__ void dequantize_V_turbo_split2_0(const void * 
             // PERM_INV maps original → permuted position
             // Wait: PERM[rank] = original_channel, so PERM_INV[original] = rank/position
             const int orig_ch = base + l;
-            const int perm_pos = TURBO_SPLIT2_PERM_INV[orig_ch];
+            const int perm_pos = turbo_split2_perm_inv(orig_ch);
             float val;
             if (perm_pos < 32) {
                 // 3-bit from qs_hi: contiguous bit-pack
@@ -1117,7 +1117,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split2_0(
             for (int l = 0; l < 4; ++l) {
                 // Read original channel (base+l) from its permuted position
                 const int orig_ch = base + l;
-                const int perm_pos = TURBO_SPLIT2_PERM_INV[orig_ch];
+                const int perm_pos = turbo_split2_perm_inv(orig_ch);
                 float val;
                 if (perm_pos < 32) {
                     const int bo = perm_pos * 3;

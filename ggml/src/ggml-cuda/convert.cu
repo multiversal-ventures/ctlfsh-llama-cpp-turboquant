@@ -829,19 +829,17 @@ static __global__ void dequantize_block_turbo_split2_0(const void * __restrict__
     const block_turbo_split2_0 * x = (const block_turbo_split2_0 *) vx;
     const float norm = __half2float(x[ib].norm);
 
-    uint8_t idx;
     float val;
-    if (pos < 32) {
-        // 3-bit unpack from qs_hi
-        const int bo = pos * 3;
+    if (turbo_split2_is_outlier(pos)) {
+        const int hi = turbo_split2_hi_idx(pos);
+        const int bo = hi * 3;
         uint16_t raw;
         memcpy(&raw, &x[ib].qs_hi[bo / 8], sizeof(uint16_t));
-        idx = (raw >> (bo % 8)) & 0x7;
+        const uint8_t idx = (raw >> (bo % 8)) & 0x7;
         val = turbo_centroids_3bit_convert[idx] * norm;
     } else {
-        // 2-bit unpack from qs_lo
-        const int rpos = pos - 32;
-        idx = (x[ib].qs_lo[rpos / 4] >> ((rpos % 4) * 2)) & 0x3;
+        const int lo = turbo_split2_lo_idx(pos);
+        const uint8_t idx = (x[ib].qs_lo[lo / 4] >> ((lo % 4) * 2)) & 0x3;
         val = turbo_centroids_2bit_convert[idx] * norm;
     }
     y[i] = ggml_cuda_cast<dst_t>(val);

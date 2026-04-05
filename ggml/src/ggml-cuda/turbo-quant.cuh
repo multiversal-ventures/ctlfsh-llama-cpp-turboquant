@@ -353,39 +353,53 @@ static __device__ void quantize_f32_turbo_split_0_block(
     dst->norm = __float2half(corrected_norm);
 }
 
-// Gemma 3 4B profiled channel permutation: top 32 variance channels → positions 0-31
-// Generated from 2000-sample empirical profiling on T4 (2026-04-04)
-// PERM[rank] = original_channel (rank 0 = highest variance)
-// PERM_INV[original_channel] = rank/position in block
-// Using inline function to avoid __constant__/__device__ cross-CU issues
-static __device__ __forceinline__ int turbo_split2_perm(int rank) {
-    // Lookup: rank → original channel index
+// Gemma 3 4B bitmask-based outlier selection
+// Generated from 2000-sample empirical variance profiling on T4 (2026-04-04)
+// Channels stay in original order — no reordering. Mask says which get 3-bit vs 2-bit.
+// hi_idx/lo_idx give the packed position within qs_hi or qs_lo for each channel.
+
+static __device__ __forceinline__ bool turbo_split2_is_outlier(int ch) {
     constexpr int T[128] = {
-        111,  70, 104,  71,  67, 105, 108,  64, 125, 106, 110,  66,  96, 107, 109,  99,
-        101, 123,  97, 124, 103,  68,  69,  74,  75,  65, 126,  73, 122, 102,  78, 120,
-         82,  80, 112, 100,  84, 116,  86,  77, 115,  85,  98,  72,  83,  79,  91, 127,
-         93, 113, 117, 121,  81,  88,  76, 114,  87, 119,  89,  95,  40,  90,  92,  47,
-         36,  35,  94,  41,  50, 118,  62,  33,   5,  48,  56,  38,  37,  49,  39,  58,
-         51,  59,  45,  32,   0,  42,  61,  44,   9,  43,  60,  34,  14,  31,  29,  53,
-          6,  52,   4,   1,   7,  63,  55,  10,  18,  57,  15,  23,  13,   2,   8,  22,
-         11,  19,  16,  46,  54,  17,   3,  28,  12,  30,  20,  24,  25,  21,  27,  26
+         0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+         0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+         0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+         0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+         1,  1,  1,  1,  1,  1,  1,  1,  0,  1,  1,  1,  0,  0,  1,  0,
+         0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+         1,  1,  0,  1,  0,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+         0,  0,  0,  0,  0,  0,  0,  0,  1,  0,  1,  1,  1,  1,  1,  0
     };
-    return T[rank];
+    return T[ch] != 0;
 }
 
-static __device__ __forceinline__ int turbo_split2_perm_inv(int orig_ch) {
-    // Lookup: original channel → rank/position in block
+static __device__ __forceinline__ int turbo_split2_hi_idx(int ch) {
+    // Outlier channel → index within qs_hi[12] (0-31). Returns -1 for regular channels.
     constexpr int T[128] = {
-         84,  99, 109, 118,  98,  72,  96, 100, 110,  88, 103, 112, 120, 108,  92, 106,
-        114, 117, 104, 113, 122, 125, 111, 107, 123, 124, 127, 126, 119,  94, 121,  93,
-         83,  71,  91,  65,  64,  76,  75,  78,  60,  67,  85,  89,  87,  82, 115,  63,
-         73,  77,  68,  80,  97,  95, 116, 102,  74, 105,  79,  81,  90,  86,  70, 101,
-          7,  25,  11,   4,  21,  22,   1,   3,  43,  27,  23,  24,  54,  39,  30,  45,
-         33,  52,  32,  44,  36,  41,  38,  56,  53,  58,  61,  46,  62,  48,  66,  59,
-         12,  18,  42,  15,  35,  16,  29,  20,   2,   5,   9,  13,   6,  14,  10,   0,
-         34,  49,  55,  40,  37,  50,  69,  57,  31,  51,  28,  17,  19,   8,  26,  47
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+         0,  1,  2,  3,  4,  5,  6,  7, -1,  8,  9, 10, -1, -1, 11, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        12, 13, -1, 14, -1, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        -1, -1, -1, -1, -1, -1, -1, -1, 26, -1, 27, 28, 29, 30, 31, -1
     };
-    return T[orig_ch];
+    return T[ch];
+}
+
+static __device__ __forceinline__ int turbo_split2_lo_idx(int ch) {
+    // Regular channel → index within qs_lo[24] (0-95). Returns -1 for outlier channels.
+    constexpr int T[128] = {
+         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+        -1, -1, -1, -1, -1, -1, -1, -1, 64, -1, -1, -1, 65, 66, -1, 67,
+        68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83,
+        -1, -1, 84, -1, 85, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        86, 87, 88, 89, 90, 91, 92, 93, -1, 94, -1, -1, -1, -1, -1, 95
+    };
+    return T[ch];
 }
 
 // Profiling: accumulate per-channel variance after WHT rotation
@@ -437,37 +451,29 @@ static __device__ void quantize_f32_turbo_split2_0_block(
     dst->padding[0] = 0;
     dst->padding[1] = 0;
 
-    // Step 4: Permute channels — reorder by variance (high-variance first)
-    // DISABLED: using bitmask approach instead of permutation to avoid
-    // needing to update all dequant paths (convert.cu, getrows.cu, FA)
-    // With identity permutation, channels 0-31 get 3-bit, 32-127 get 2-bit
-    float xp[128];
-    for (int j = 0; j < 128; j++) xp[j] = x[j]; // identity for now
-
-    // Step 5: Quantize permuted channels 0-31 (outliers) with 3-bit → qs_hi[12]
+    // Step 4: Quantize with bitmask — outlier channels get 3-bit, regular get 2-bit
+    // Channels stay in original order. Bitmask determines codebook.
     float recon_norm_sq = 0.0f;
-    for (int j = 0; j < 32; j++) {
-        uint8_t idx = turbo_nearest_centroid_3bit(xp[j]);
-        recon_norm_sq += TURBO_CENTROIDS_3BIT[idx] * TURBO_CENTROIDS_3BIT[idx];
-
-        // 3-bit contiguous bit-pack
-        int bit_offset = j * 3;
-        int byte_idx = bit_offset / 8;
-        int bit_pos = bit_offset % 8;
-        dst->qs_hi[byte_idx] |= (uint8_t)((idx & 0x7) << bit_pos);
-        if (bit_pos > 5 && byte_idx + 1 < 12) {
-            dst->qs_hi[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
+    for (int j = 0; j < 128; j++) {
+        if (turbo_split2_is_outlier(j)) {
+            // 3-bit codebook → pack into qs_hi at outlier index
+            uint8_t idx = turbo_nearest_centroid_3bit(x[j]);
+            recon_norm_sq += TURBO_CENTROIDS_3BIT[idx] * TURBO_CENTROIDS_3BIT[idx];
+            int hi = turbo_split2_hi_idx(j);
+            int bit_offset = hi * 3;
+            int byte_idx = bit_offset / 8;
+            int bit_pos = bit_offset % 8;
+            dst->qs_hi[byte_idx] |= (uint8_t)((idx & 0x7) << bit_pos);
+            if (bit_pos > 5 && byte_idx + 1 < 12) {
+                dst->qs_hi[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
+            }
+        } else {
+            // 2-bit codebook → pack into qs_lo at regular index
+            uint8_t idx = turbo_nearest_centroid_2bit(x[j]);
+            recon_norm_sq += TURBO_CENTROIDS_2BIT[idx] * TURBO_CENTROIDS_2BIT[idx];
+            int lo = turbo_split2_lo_idx(j);
+            dst->qs_lo[lo / 4] |= (uint8_t)(idx << ((lo % 4) * 2));
         }
-    }
-
-    // Step 6: Quantize permuted channels 32-127 (regular) with 2-bit → qs_lo[24]
-    for (int j = 32; j < 128; j++) {
-        uint8_t idx = turbo_nearest_centroid_2bit(xp[j]);
-        recon_norm_sq += TURBO_CENTROIDS_2BIT[idx] * TURBO_CENTROIDS_2BIT[idx];
-
-        // 2-bit pack: 4 values per byte
-        int rpos = j - 32;  // 0-95
-        dst->qs_lo[rpos / 4] |= (uint8_t)(idx << ((rpos % 4) * 2));
     }
 
     // Step 6: Norm correction

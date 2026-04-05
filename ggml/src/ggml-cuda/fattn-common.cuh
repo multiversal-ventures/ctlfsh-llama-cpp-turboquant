@@ -1035,24 +1035,19 @@ static __device__ __forceinline__ void dequantize_V_turbo_split2_0(const void * 
         const int base = lane * 4;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            // I need original channel (base+l). It's at permuted position PERM_INV[base+l].
-            // PERM_INV maps original → permuted position
-            // Wait: PERM[rank] = original_channel, so PERM_INV[original] = rank/position
-            const int orig_ch = base + l;
-            const int perm_pos = orig_ch; // identity permutation
+            const int ch = base + l;
             float val;
-            if (perm_pos < 32) {
-                // 3-bit from qs_hi: contiguous bit-pack
-                const int bo = perm_pos * 3;
+            if (turbo_split2_is_outlier(ch)) {
+                const int hi = turbo_split2_hi_idx(ch);
+                const int bo = hi * 3;
                 uint16_t raw;
                 memcpy(&raw, &x[ib].qs_hi[bo / 8], sizeof(uint16_t));
                 const uint8_t idx = (raw >> (bo % 8)) & 0x7;
                 val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
             } else {
-                // 2-bit from qs_lo: 4 per byte
-                const int rpos = perm_pos - 32;
-                const uint8_t byte_val = __ldg(&x[ib].qs_lo[rpos / 4]);
-                const uint8_t idx = (byte_val >> ((rpos % 4) * 2)) & 0x3;
+                const int lo = turbo_split2_lo_idx(ch);
+                const uint8_t byte_val = __ldg(&x[ib].qs_lo[lo / 4]);
+                const uint8_t idx = (byte_val >> ((lo % 4) * 2)) & 0x3;
                 val = TURBO_CENTROIDS_2BIT_DEQUANT[idx] * norm;
             }
             if (l == 0) r0 = val; else if (l == 1) r1 = val;
@@ -1060,8 +1055,7 @@ static __device__ __forceinline__ void dequantize_V_turbo_split2_0(const void * 
         }
     }
 
-    // Values are now in ORIGINAL channel order (not permuted).
-    // Inverse WHT: signs2 → FWHT → (1/√128) × signs1
+    // Channels in original order. Inverse WHT: signs2 → FWHT → (1/√128) × signs1
     const int base = lane * 4;
     r0 *= TURBO_WHT_SIGNS2[base + 0];
     r1 *= TURBO_WHT_SIGNS2[base + 1];
@@ -1116,19 +1110,19 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split2_0(
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
                 // Read original channel (base+l) from its permuted position
-                const int orig_ch = base + l;
-                const int perm_pos = orig_ch; // identity permutation
+                const int ch = base + l;
                 float val;
-                if (perm_pos < 32) {
-                    const int bo = perm_pos * 3;
+                if (turbo_split2_is_outlier(ch)) {
+                    const int hi = turbo_split2_hi_idx(ch);
+                    const int bo = hi * 3;
                     uint16_t raw;
                     memcpy(&raw, &K_split2[ib].qs_hi[bo / 8], sizeof(uint16_t));
                     const uint8_t idx = (raw >> (bo % 8)) & 0x7;
                     val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
                 } else {
-                    const int rpos = perm_pos - 32;
-                    const uint8_t byte_val = __ldg(&K_split2[ib].qs_lo[rpos / 4]);
-                    const uint8_t idx = (byte_val >> ((rpos % 4) * 2)) & 0x3;
+                    const int lo = turbo_split2_lo_idx(ch);
+                    const uint8_t byte_val = __ldg(&K_split2[ib].qs_lo[lo / 4]);
+                    const uint8_t idx = (byte_val >> ((lo % 4) * 2)) & 0x3;
                     val = TURBO_CENTROIDS_2BIT_DEQUANT[idx] * norm;
                 }
                 if (l == 0) r0 = val; else if (l == 1) r1 = val;

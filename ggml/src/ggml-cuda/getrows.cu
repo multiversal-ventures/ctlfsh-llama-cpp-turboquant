@@ -240,20 +240,20 @@ static __global__ void k_get_rows_turbo_split2(
 
             float buf[QK_TURBO_SPLIT2];
 
-            // First 32 elements: 3-bit from qs_hi
-            for (int j = 0; j < 32; j++) {
-                const int bo = j * 3;
-                uint16_t raw;
-                memcpy(&raw, &blk->qs_hi[bo / 8], sizeof(uint16_t));
-                const uint8_t idx = (raw >> (bo % 8)) & 0x7;
-                buf[j] = TURBO_CENTROIDS_3BIT[idx] * norm;
-            }
-
-            // Remaining 96 elements: 2-bit from qs_lo
-            for (int j = 32; j < QK_TURBO_SPLIT2; j++) {
-                const int rpos = j - 32;
-                const uint8_t idx = (blk->qs_lo[rpos / 4] >> ((rpos % 4) * 2)) & 0x3;
-                buf[j] = TURBO_CENTROIDS_2BIT[idx] * norm;
+            // Dequant each channel using bitmask to select codebook
+            for (int j = 0; j < QK_TURBO_SPLIT2; j++) {
+                if (turbo_split2_is_outlier(j)) {
+                    const int hi = turbo_split2_hi_idx(j);
+                    const int bo = hi * 3;
+                    uint16_t raw;
+                    memcpy(&raw, &blk->qs_hi[bo / 8], sizeof(uint16_t));
+                    const uint8_t idx = (raw >> (bo % 8)) & 0x7;
+                    buf[j] = TURBO_CENTROIDS_3BIT[idx] * norm;
+                } else {
+                    const int lo = turbo_split2_lo_idx(j);
+                    const uint8_t idx = (blk->qs_lo[lo / 4] >> ((lo % 4) * 2)) & 0x3;
+                    buf[j] = TURBO_CENTROIDS_2BIT[idx] * norm;
+                }
             }
 
             // Inverse WHT rotation

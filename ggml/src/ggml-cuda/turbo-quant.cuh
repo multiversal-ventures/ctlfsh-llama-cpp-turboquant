@@ -353,6 +353,16 @@ static __device__ void quantize_f32_turbo_split_0_block(
     dst->norm = __float2half(corrected_norm);
 }
 
+// Profiling: accumulate per-channel variance after WHT rotation
+// Enable with TURBO_SPLIT2_PROFILE=1, results printed after TURBO_SPLIT2_PROFILE_N tokens
+#ifndef TURBO_SPLIT2_PROFILE
+#define TURBO_SPLIT2_PROFILE 1
+#endif
+#define TURBO_SPLIT2_PROFILE_N 2000
+
+__device__ static float turbo_split2_var_accum[128] = {0};
+__device__ static int   turbo_split2_var_count = 0;
+
 // Quantize 128 floats → 1 block_turbo_split2_0 (2.5-bit split: 32@3bit + 96@2bit)
 static __device__ void quantize_f32_turbo_split2_0_block(
         const float * __restrict__ src,
@@ -367,6 +377,25 @@ static __device__ void quantize_f32_turbo_split2_0_block(
     float x[128];
     for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
     turbo_rotate_forward(x);
+
+    // Profiling: accumulate per-channel x^2 after WHT
+#if TURBO_SPLIT2_PROFILE
+    {
+        for (int j = 0; j < 128; j++) {
+            atomicAdd(&turbo_split2_var_accum[j], x[j] * x[j]);
+        }
+        int prev = atomicAdd(&turbo_split2_var_count, 1);
+        if (prev == TURBO_SPLIT2_PROFILE_N - 1) {
+            // Print variance ranking after N tokens
+            printf("TURBO_SPLIT2_PROFILE: %d samples collected\n", TURBO_SPLIT2_PROFILE_N);
+            printf("CHANNEL_VARIANCE:");
+            for (int j = 0; j < 128; j++) {
+                printf(" %.6f", turbo_split2_var_accum[j] / TURBO_SPLIT2_PROFILE_N);
+            }
+            printf("\n");
+        }
+    }
+#endif
 
     // Step 3: Clear output arrays
     for (int j = 0; j < 12; j++) dst->qs_hi[j] = 0;

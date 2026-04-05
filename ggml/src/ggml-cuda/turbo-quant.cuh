@@ -353,10 +353,35 @@ static __device__ void quantize_f32_turbo_split_0_block(
     dst->norm = __float2half(corrected_norm);
 }
 
+// Gemma 3 4B profiled channel permutation: top 32 variance channels → positions 0-31
+// Generated from 2000-sample empirical profiling on T4 (2026-04-04)
+// PERM[j] maps original channel j → permuted position (used in quantize)
+// PERM_INV[p] maps permuted position p → original channel (used in dequant to find where to read)
+__constant__ static const int TURBO_SPLIT2_PERM[128] = {
+    111,  70, 104,  71,  67, 105, 108,  64, 125, 106, 110,  66,  96, 107, 109,  99,
+    101, 123,  97, 124, 103,  68,  69,  74,  75,  65, 126,  73, 122, 102,  78, 120,
+     82,  80, 112, 100,  84, 116,  86,  77, 115,  85,  98,  72,  83,  79,  91, 127,
+     93, 113, 117, 121,  81,  88,  76, 114,  87, 119,  89,  95,  40,  90,  92,  47,
+     36,  35,  94,  41,  50, 118,  62,  33,   5,  48,  56,  38,  37,  49,  39,  58,
+     51,  59,  45,  32,   0,  42,  61,  44,   9,  43,  60,  34,  14,  31,  29,  53,
+      6,  52,   4,   1,   7,  63,  55,  10,  18,  57,  15,  23,  13,   2,   8,  22,
+     11,  19,  16,  46,  54,  17,   3,  28,  12,  30,  20,  24,  25,  21,  27,  26
+};
+
+__constant__ static const int TURBO_SPLIT2_PERM_INV[128] = {
+     84,  99, 109, 118,  98,  72,  96, 100, 110,  88, 103, 112, 120, 108,  92, 106,
+    114, 117, 104, 113, 122, 125, 111, 107, 123, 124, 127, 126, 119,  94, 121,  93,
+     83,  71,  91,  65,  64,  76,  75,  78,  60,  67,  85,  89,  87,  82, 115,  63,
+     73,  77,  68,  80,  97,  95, 116, 102,  74, 105,  79,  81,  90,  86,  70, 101,
+      7,  25,  11,   4,  21,  22,   1,   3,  43,  27,  23,  24,  54,  39,  30,  45,
+     33,  52,  32,  44,  36,  41,  38,  56,  53,  58,  61,  46,  62,  48,  66,  59,
+     12,  18,  42,  15,  35,  16,  29,  20,   2,   5,   9,  13,   6,  14,  10,   0,
+     34,  49,  55,  40,  37,  50,  69,  57,  31,  51,  28,  17,  19,   8,  26,  47
+};
+
 // Profiling: accumulate per-channel variance after WHT rotation
-// Enable with TURBO_SPLIT2_PROFILE=1, results printed after TURBO_SPLIT2_PROFILE_N tokens
 #ifndef TURBO_SPLIT2_PROFILE
-#define TURBO_SPLIT2_PROFILE 1
+#define TURBO_SPLIT2_PROFILE 0
 #endif
 #define TURBO_SPLIT2_PROFILE_N 2000
 
@@ -403,10 +428,16 @@ static __device__ void quantize_f32_turbo_split2_0_block(
     dst->padding[0] = 0;
     dst->padding[1] = 0;
 
-    // Step 4: Quantize channels 0-31 with 3-bit codebook → qs_hi[12]
+    // Step 4: Permute channels — reorder by variance (high-variance first)
+    // PERM maps: descending-variance-rank → original channel index
+    // So permuted[p] = x[PERM[p]]: position p gets the value from original channel PERM[p]
+    float xp[128];
+    for (int j = 0; j < 128; j++) xp[j] = x[TURBO_SPLIT2_PERM[j]];
+
+    // Step 5: Quantize permuted channels 0-31 (outliers) with 3-bit → qs_hi[12]
     float recon_norm_sq = 0.0f;
     for (int j = 0; j < 32; j++) {
-        uint8_t idx = turbo_nearest_centroid_3bit(x[j]);
+        uint8_t idx = turbo_nearest_centroid_3bit(xp[j]);
         recon_norm_sq += TURBO_CENTROIDS_3BIT[idx] * TURBO_CENTROIDS_3BIT[idx];
 
         // 3-bit contiguous bit-pack
@@ -419,9 +450,9 @@ static __device__ void quantize_f32_turbo_split2_0_block(
         }
     }
 
-    // Step 5: Quantize channels 32-127 with 2-bit codebook → qs_lo[24]
+    // Step 6: Quantize permuted channels 32-127 (regular) with 2-bit → qs_lo[24]
     for (int j = 32; j < 128; j++) {
-        uint8_t idx = turbo_nearest_centroid_2bit(x[j]);
+        uint8_t idx = turbo_nearest_centroid_2bit(xp[j]);
         recon_norm_sq += TURBO_CENTROIDS_2BIT[idx] * TURBO_CENTROIDS_2BIT[idx];
 
         // 2-bit pack: 4 values per byte

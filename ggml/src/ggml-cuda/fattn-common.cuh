@@ -1035,18 +1035,22 @@ static __device__ __forceinline__ void dequantize_V_turbo_split2_0(const void * 
         const int base = lane * 4;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const int pos = base + l;
+            // I need original channel (base+l). It's at permuted position PERM_INV[base+l].
+            // PERM_INV maps original → permuted position
+            // Wait: PERM[rank] = original_channel, so PERM_INV[original] = rank/position
+            const int orig_ch = base + l;
+            const int perm_pos = TURBO_SPLIT2_PERM_INV[orig_ch];
             float val;
-            if (pos < 32) {
+            if (perm_pos < 32) {
                 // 3-bit from qs_hi: contiguous bit-pack
-                const int bo = pos * 3;
+                const int bo = perm_pos * 3;
                 uint16_t raw;
                 memcpy(&raw, &x[ib].qs_hi[bo / 8], sizeof(uint16_t));
                 const uint8_t idx = (raw >> (bo % 8)) & 0x7;
                 val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
             } else {
                 // 2-bit from qs_lo: 4 per byte
-                const int rpos = pos - 32;
+                const int rpos = perm_pos - 32;
                 const uint8_t byte_val = __ldg(&x[ib].qs_lo[rpos / 4]);
                 const uint8_t idx = (byte_val >> ((rpos % 4) * 2)) & 0x3;
                 val = TURBO_CENTROIDS_2BIT_DEQUANT[idx] * norm;
@@ -1056,6 +1060,7 @@ static __device__ __forceinline__ void dequantize_V_turbo_split2_0(const void * 
         }
     }
 
+    // Values are now in ORIGINAL channel order (not permuted).
     // Inverse WHT: signs2 → FWHT → (1/√128) × signs1
     const int base = lane * 4;
     r0 *= TURBO_WHT_SIGNS2[base + 0];
@@ -1110,16 +1115,18 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split2_0(
             const int base = lane * 4;
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
-                const int pos = base + l;
+                // Read original channel (base+l) from its permuted position
+                const int orig_ch = base + l;
+                const int perm_pos = TURBO_SPLIT2_PERM_INV[orig_ch];
                 float val;
-                if (pos < 32) {
-                    const int bo = pos * 3;
+                if (perm_pos < 32) {
+                    const int bo = perm_pos * 3;
                     uint16_t raw;
                     memcpy(&raw, &K_split2[ib].qs_hi[bo / 8], sizeof(uint16_t));
                     const uint8_t idx = (raw >> (bo % 8)) & 0x7;
                     val = TURBO_CENTROIDS_3BIT_FA[idx] * norm;
                 } else {
-                    const int rpos = pos - 32;
+                    const int rpos = perm_pos - 32;
                     const uint8_t byte_val = __ldg(&K_split2[ib].qs_lo[rpos / 4]);
                     const uint8_t idx = (byte_val >> ((rpos % 4) * 2)) & 0x3;
                     val = TURBO_CENTROIDS_2BIT_DEQUANT[idx] * norm;
@@ -1129,7 +1136,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo_split2_0(
             }
         }
 
-        // Inverse WHT: signs2 → FWHT → 1/sqrt(128) * signs1
+        // Values in original channel order. Inverse WHT: signs2 → FWHT → 1/sqrt(128) * signs1
         {
             const int base = lane * 4;
             r0 *= TURBO_WHT_SIGNS2[base + 0];

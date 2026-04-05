@@ -438,10 +438,11 @@ static __device__ void quantize_f32_turbo_split2_0_block(
     dst->padding[1] = 0;
 
     // Step 4: Permute channels — reorder by variance (high-variance first)
-    // PERM maps: descending-variance-rank → original channel index
-    // So permuted[p] = x[PERM[p]]: position p gets the value from original channel PERM[p]
+    // DISABLED: using bitmask approach instead of permutation to avoid
+    // needing to update all dequant paths (convert.cu, getrows.cu, FA)
+    // With identity permutation, channels 0-31 get 3-bit, 32-127 get 2-bit
     float xp[128];
-    for (int j = 0; j < 128; j++) xp[j] = x[turbo_split2_perm(j)];
+    for (int j = 0; j < 128; j++) xp[j] = x[j]; // identity for now
 
     // Step 5: Quantize permuted channels 0-31 (outliers) with 3-bit → qs_hi[12]
     float recon_norm_sq = 0.0f;
